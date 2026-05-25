@@ -24,7 +24,11 @@ from config import (
     NOISE_FILE_PATTERNS,
     RELEASE_NOTES_MAX_VERSIONS,
 )
-from models import ChangeAnalysis, CommitInfo, Release, Theme, LLMFullReport, LLMExecutiveSummary, LLMCompatibilityRisk, LLMNoteAnalysis
+from models import (
+    ChangeAnalysis, CommitInfo, Release, Theme,
+    LLMFullReport, LLMExecutiveSummary, LLMCompatibilityRisk, LLMNoteAnalysis,
+    ProgressiveFix, VersionEvolution,
+)
 
 
 @dataclass
@@ -142,6 +146,7 @@ def build_analysis_data(
     commits: List[CommitInfo],
     diff_files: List[Dict[str, Any]],
     lang: str,
+    scoped_releases: Optional[Sequence[Release]] = None,
 ) -> Dict[str, Any]:
     """Build a single master analysis data file for LLM comprehensive analysis.
 
@@ -175,10 +180,11 @@ def build_analysis_data(
     # risk, or interpretation is passed — the LLM performs ALL semantic
     # analysis from scratch to avoid template bias.
     notes_data = []
-    for idx, item in enumerate(analyses, 1):
+    for item in analyses:
         notes_data.append({
-            "id": f"R-{idx:03d}",
+            "id": item.note_id or "",
             "raw_text": item.raw_text,
+            "source_version": item.release_tag,
         })
 
     # Commits (top relevant, with file limits)
@@ -195,16 +201,32 @@ def build_analysis_data(
     total_add = sum(f.get("additions", 0) for f in diff_files)
     total_del = sum(f.get("deletions", 0) for f in diff_files)
 
+    # Cross-version scope metadata
+    meta: Dict[str, Any] = {
+        "repo": repo,
+        "target_version": target.tag_name,
+        "compare_version": compare.tag_name if compare else "",
+        "language": lang,
+        "analysis_mode": "commit-message-bridge",
+        "notes_total": len(notes_data),
+        "commits_included": len(commits_data),
+    }
+    if scoped_releases is not None and len(scoped_releases) > 1:
+        meta["is_version_range"] = True
+        meta["version_count"] = len(scoped_releases)
+        meta["versions_in_scope"] = [r.tag_name for r in scoped_releases]
+        # Per-version note counts (helps LLM detect sparse vs dense releases)
+        from collections import Counter
+        version_counts = Counter(item.release_tag for item in analyses if item.release_tag)
+        meta["notes_per_version"] = {
+            r.tag_name: version_counts.get(r.tag_name, 0)
+            for r in scoped_releases
+        }
+    else:
+        meta["is_version_range"] = False
+
     data = {
-        "meta": {
-            "repo": repo,
-            "target_version": target.tag_name,
-            "compare_version": compare.tag_name if compare else "",
-            "language": lang,
-            "analysis_mode": "commit-message-bridge",
-            "notes_total": len(notes_data),
-            "commits_included": len(commits_data),
-        },
+        "meta": meta,
         "release_notes": notes_data,
         "commits": commits_data,
         "code_changes": {
@@ -260,7 +282,9 @@ def _build_llm_instructions(lang: str) -> str:
         return (
             "你是一个资深的 OpenClaw release notes 分析师。OpenClaw 是一款插件化 AI 助手框架。\n\n"
             "我会提供三部分原始数据（未经过任何预分析）：\n"
-            "1. release_notes: 本次版本的所有 release note（仅原始文本，每条有 ID: R-001, R-002...）\n"
+            "1. release_notes: 本次分析范围内的所有 release note（仅原始文本，每条有 ID: R-001, R-002...）。"
+            "每条 note 都有 source_version 字段，标注该 note 来自哪个 release tag（如 v2026.4.12）。"
+            "如果分析范围包含多个版本，source_version 能帮你判断变更是在哪个中间版本引入的。\n"
             "2. commits: 版本间的 commit 列表（含 commit message 和改动文件路径）\n"
             "3. code_changes: 代码变更统计摘要（按目录聚合 + 关键文件）\n\n"
             "==== 你的任务 ====\n\n"
@@ -274,6 +298,20 @@ def _build_llm_instructions(lang: str) -> str:
             "- 同一组件的配套调整（如 Feishu 的认证+消息+线程相关变更）\n"
             "- 不要按组件机械分组；按\"功能意图\"分组\n"
             "- 尽量让每个 note 都属于一个主题，不要漏掉\n\n"
+            "==== 跨版本分析（如 source_version 显示多个版本）====\n\n"
+            "如果 release_notes 来自多个版本，请在分析中特别关注以下两类跨版本模式：\n\n"
+            "**渐进式修复检测（Optimization #3）**：\n"
+            "- 识别同一个 bug/问题是否被分多个版本逐步修复\n"
+            "- 典型模式：v1 引入临时缓解 → v2 部分修复 → v3 完整修复\n"
+            "- 也包含：早期版本引入的问题在后续版本中被修复（regression-fix 链）\n"
+            "- 每个渐进式修复链必须标注：问题描述、每个阶段的版本和 note_id、修复完整度（partial/mitigation/complete）、最终状态\n"
+            "- 注意：一个 note 可能同时属于某个主题和某个渐进式修复链，这是正常的\n\n"
+            "**累积 Breaking Change 分析（Optimization #4）**：\n"
+            "- 评估跨版本升级路径上的累积兼容性风险\n"
+            "- 核心判断：单个版本看起来低风险，但多个版本的 breaking change 叠加后，整体影响是否被低估\n"
+            "- 关注信号：同一组件在多个版本中持续调整接口/行为；早期版本的废弃项在后续版本中真正移除；多个版本的配置变更叠加后需要多次迁移\n"
+            "- 必须输出 individual_risk（单版本风险）vs cumulative_risk（累积风险），并解释 risk_escalation_reason\n"
+            "- 在 theme 的 reasoning 中标注该主题涉及的版本范围\n\n"
             "==== 第二阶段：主题级分析 ====\n\n"
             "对每个主题进行深度分析：\n"
             "- 主题整体风险级别（high/medium/low），以最高风险条目为准\n"
@@ -318,6 +356,16 @@ def _build_llm_instructions(lang: str) -> str:
             "5. 未记录变更（shadow_changes）：\n"
             "   - commits 有但 release notes 没提的 public surface 变更\n"
             "   - 忽略纯内部重构、测试、文档类 commit\n\n"
+            "6. 渐进式修复检测（progressive_fixes，仅在多版本时输出）：\n"
+            "   - 每个修复链包含：fix_id、issue_description（问题描述）、stages（阶段列表，每阶段含 note_id/source_version/fix_description/completeness）、final_status、impact_assessment\n"
+            "   - completeness 取值：mitigation（缓解）/ partial（部分修复）/ complete（完整修复）\n"
+            "   - final_status 取值：fully_fixed（已完全修复）/ partially_fixed（仍部分修复）/ mitigated（仅缓解）\n"
+            "   - 如果没有检测到渐进式修复，输出空数组 []\n\n"
+            "7. 累积 Breaking Change 分析（version_evolution，仅在多版本时输出）：\n"
+            "   - 每个演进条目包含：evolution_id、description（演进描述）、affected_versions（版本范围）、individual_risk（单版本风险）、cumulative_risk（累积风险）、risk_escalation_reason（为什么累积风险更高）、related_themes（关联主题ID）、affected_components、migration_advice\n"
+            "   - risk_escalation_reason 是核心字段，必须具体说明为什么\"跨多个版本升级\"比\"逐个版本升级\"更危险\n"
+            "   - 例如：\"v2026.4.10 废弃了旧 QR 绑定方式，v2026.4.11 修改了默认 auth 流程，v2026.4.12 完全移除 QR 支持。单个版本看都是渐进式调整，但跨越三个版本直接升级需要同时处理废弃通知、行为变化和接口移除三重影响，且没有中间版本的迁移缓冲\"\n"
+            "   - 如果没有检测到累积风险，输出空数组 []\n\n"
             "==== 输出格式 ====\n\n"
             "JSON 对象，顶层字段如下：\n"
             "{\n"
@@ -374,6 +422,33 @@ def _build_llm_instructions(lang: str) -> str:
             '  ],\n'
             '  "shadow_changes": [\n'
             '    {"description": "commit ghi9012 新增了未在 release notes 中提及的 OAuth 回调接口", "evidence_commits": ["ghi9012"]}\n'
+            '  ],\n'
+            '  "progressive_fixes": [\n'
+            '    {\n'
+            '      "fix_id": "PF-01",\n'
+            '      "issue_description": "Feishu 认证在特定场景下 token 刷新失败",\n'
+            '      "stages": [\n'
+            '        {"note_id": "R-015", "source_version": "v2026.4.10", "fix_description": "增加 token 刷新重试次数", "completeness": "mitigation"},\n'
+            '        {"note_id": "R-042", "source_version": "v2026.4.11", "fix_description": "修复 refresh 逻辑中的竞态条件", "completeness": "partial"},\n'
+            '        {"note_id": "R-089", "source_version": "v2026.4.12", "fix_description": "重构 Feishu auth 模块，彻底消除 token 刷新问题", "completeness": "complete"}\n'
+            '      ],\n'
+            '      "final_status": "fully_fixed",\n'
+            '      "impact_assessment": "从 v2026.4.10 升级到 v2026.4.12 可完全解决该问题；若停留在中间版本，仍可能遇到偶发认证失败",\n'
+            '      "affected_components": ["Feishu", "Auth"]\n'
+            '    }\n'
+            '  ],\n'
+            '  "version_evolution": [\n'
+            '    {\n'
+            '      "evolution_id": "VE-01",\n'
+            '      "description": "Feishu 认证接口经历三次连续调整",\n'
+            '      "affected_versions": ["v2026.4.10", "v2026.4.11", "v2026.4.12"],\n'
+            '      "individual_risk": "low",\n'
+            '      "cumulative_risk": "high",\n'
+            '      "risk_escalation_reason": "v2026.4.10 废弃了旧 QR 绑定方式，v2026.4.11 修改了默认 auth 流程，v2026.4.12 完全移除 QR 支持。单个版本看都是渐进式调整，但跨越三个版本直接升级需要同时处理废弃通知、行为变化和接口移除三重影响，且没有中间版本的迁移缓冲",\n'
+            '      "related_themes": ["T-01"],\n'
+            '      "affected_components": ["Feishu", "Auth"],\n'
+            '      "migration_advice": "建议分步升级：先升级到 v2026.4.11 完成手动配置迁移，验证无误后再升级到 v2026.4.12。不要跨两个中间版本直接升级。"\n'
+            '    }\n'
             '  ]\n'
             "}\n\n"
             "关键要求：\n"
@@ -383,13 +458,17 @@ def _build_llm_instructions(lang: str) -> str:
             "4) reasoning 必须引用具体的 commit message 原文片段\n"
             "5) 不要强行关联不相关的 commit\n"
             "6) 不要编造不存在的变更\n"
-            "7) 主题名要简洁具体，不要用\"其他变更\"\"杂项\""
+            "7) 主题名要简洁具体，不要用\"其他变更\"\"杂项\"\n"
+            "8) progressive_fixes 和 version_evolution 只在分析范围包含多个版本时输出；单版本分析输出空数组 []\n"
+            "9) risk_escalation_reason 必须具体，不能写\"多个变更叠加导致风险增加\"这种空话"
         )
     else:
         return (
             "You are a senior OpenClaw release notes analyst. OpenClaw is a plugin-based AI assistant framework.\n\n"
             "I will provide three raw data sections (NO pre-analysis):\n"
-            "1. release_notes: All release notes for this version (raw text only, each with an ID: R-001, R-002...)\n"
+            "1. release_notes: All release notes in the analysis scope (raw text only, each with an ID: R-001, R-002...). "
+            "Each note has a source_version field indicating which release tag it comes from (e.g., v2026.4.12). "
+            "If the analysis scope spans multiple versions, source_version helps you determine which intermediate version introduced a change.\n"
             "2. commits: Commits between versions (with messages and changed file paths)\n"
             "3. code_changes: Code change statistics (directory-level aggregation + key files)\n\n"
             "==== Your Task ====\n\n"
@@ -403,6 +482,20 @@ def _build_llm_instructions(lang: str) -> str:
             "- Coordinated adjustments to the same component\n"
             "- Do NOT group mechanically by component\n"
             "- Include every note in a theme; do not leave notes unclassified\n\n"
+            "==== Cross-Version Analysis (when source_version shows multiple versions) ====\n\n"
+            "If release_notes come from multiple versions, pay special attention to the following cross-version patterns:\n\n"
+            "**Progressive Fix Detection (Optimization #3):**\n"
+            "- Identify whether the same bug/issue was fixed incrementally across multiple versions\n"
+            "- Typical pattern: v1 introduces temporary mitigation → v2 partial fix → v3 complete fix\n"
+            "- Also includes: issues introduced in early versions that were fixed in later versions (regression-fix chains)\n"
+            "- Each progressive fix chain must include: issue description, stages (note_id/source_version/fix_description/completeness per stage), final status, impact assessment\n"
+            "- Note: a single note may belong to both a theme and a progressive fix chain — this is normal\n\n"
+            "**Cumulative Breaking Change Analysis (Optimization #4):**\n"
+            "- Assess cumulative compatibility risk across the upgrade path\n"
+            "- Core judgment: individual versions may appear low-risk, but do multiple breaking changes compound into an underestimated aggregate impact?\n"
+            "- Watch for signals: same component adjusted across multiple versions; early deprecation followed by actual removal in later versions; multiple config changes requiring successive migrations\n"
+            "- Must output individual_risk (per-version) vs cumulative_risk (across the range), with risk_escalation_reason explaining why\n"
+            "- Annotate the version range involved in each theme's reasoning\n\n"
             "==== Phase 2: Theme-Level Analysis ====\n\n"
             "For each theme, perform deep analysis:\n"
             "- Overall theme risk level (high/medium/low)\n"
@@ -443,6 +536,16 @@ def _build_llm_instructions(lang: str) -> str:
             "5. shadow_changes:\n"
             "   - Public surface changes present in commits but absent from release notes\n"
             "   - Ignore internal refactoring, tests, docs commits\n\n"
+            "6. progressive_fixes (only when multiple versions are in scope):\n"
+            "   - Each fix chain includes: fix_id, issue_description, stages (list with note_id/source_version/fix_description/completeness per stage), final_status, impact_assessment\n"
+            "   - completeness values: mitigation / partial / complete\n"
+            "   - final_status values: fully_fixed / partially_fixed / mitigated\n"
+            "   - Output empty array [] if no progressive fixes detected\n\n"
+            "7. version_evolution (only when multiple versions are in scope):\n"
+            "   - Each evolution entry includes: evolution_id, description, affected_versions, individual_risk (per-version), cumulative_risk (across range), risk_escalation_reason (why cumulative > individual), related_themes, affected_components, migration_advice\n"
+            "   - risk_escalation_reason is the CORE field — must specifically explain why upgrading across multiple versions at once is riskier than upgrading version-by-version\n"
+            "   - Example: \"v1 deprecated the old QR binding, v2 changed default auth flow, v3 fully removed QR support. Individually each is a gradual adjustment, but jumping from v0 to v3 requires handling deprecation notice, behavior change, and API removal all at once, with no intermediate migration buffer\"\n"
+            "   - Output empty array [] if no cumulative risk detected\n\n"
             "==== Output Format ====\n\n"
             "JSON object with these top-level fields:\n"
             "{\n"
@@ -452,7 +555,9 @@ def _build_llm_instructions(lang: str) -> str:
             '  "detailed_notes": [...],\n'
             '  "compatibility_risks": [...],\n'
             '  "test_points": [...],\n'
-            '  "shadow_changes": [...]\n'
+            '  "shadow_changes": [...],\n'
+            '  "progressive_fixes": [...],\n'
+            '  "version_evolution": [...]\n'
             "}\n\n"
             "Critical requirements:\n"
             "1) interpretation must be DEEP — answer WHAT changed, WHAT is the impact, WHAT to do\n"
@@ -461,7 +566,9 @@ def _build_llm_instructions(lang: str) -> str:
             "4) reasoning MUST quote specific commit message snippets\n"
             "5) Do not force associations for unrelated commits\n"
             "6) Do not invent changes\n"
-            "7) Theme names must be concise and specific; avoid vague names like \"Other Changes\""
+            "7) Theme names must be concise and specific; avoid vague names like \"Other Changes\"\n"
+            "8) progressive_fixes and version_evolution only output when analysis scope spans multiple versions; single-version analysis outputs empty arrays []\n"
+            "9) risk_escalation_reason must be specific — never write \"multiple changes compound risk\" as a generic statement"
         )
 
 
@@ -635,6 +742,48 @@ def _parse_compatibility_risk(item: Dict[str, Any]) -> Optional[LLMCompatibility
     )
 
 
+def _parse_progressive_fix(item: Dict[str, Any]) -> Optional[ProgressiveFix]:
+    """Parse a progressive fix chain from LLM output."""
+    fix_id = item.get("fix_id", "")
+    if not fix_id:
+        return None
+    stages = []
+    for s in item.get("stages", []):
+        if isinstance(s, dict):
+            stages.append({
+                "note_id": s.get("note_id", ""),
+                "source_version": s.get("source_version", ""),
+                "fix_description": s.get("fix_description", ""),
+                "completeness": s.get("completeness", ""),
+            })
+    return ProgressiveFix(
+        fix_id=fix_id,
+        issue_description=item.get("issue_description", ""),
+        stages=stages,
+        final_status=item.get("final_status", ""),
+        impact_assessment=item.get("impact_assessment", ""),
+        affected_components=item.get("affected_components", []),
+    )
+
+
+def _parse_version_evolution(item: Dict[str, Any]) -> Optional[VersionEvolution]:
+    """Parse a version evolution entry from LLM output."""
+    evolution_id = item.get("evolution_id", "")
+    if not evolution_id:
+        return None
+    return VersionEvolution(
+        evolution_id=evolution_id,
+        description=item.get("description", ""),
+        affected_versions=item.get("affected_versions", []),
+        individual_risk=item.get("individual_risk", "low").lower(),
+        cumulative_risk=item.get("cumulative_risk", "low").lower(),
+        risk_escalation_reason=item.get("risk_escalation_reason", ""),
+        related_themes=item.get("related_themes", []),
+        affected_components=item.get("affected_components", []),
+        migration_advice=item.get("migration_advice", ""),
+    )
+
+
 def _parse_detailed_note(item: Dict[str, Any]) -> Optional[LLMNoteAnalysis]:
     """Parse a single detailed note analysis from LLM output."""
     note_id = item.get("note_id", "")
@@ -720,6 +869,20 @@ def parse_llm_results(path: Path) -> LLMFullReport:
             sc for sc in payload.get("shadow_changes", [])
             if isinstance(sc, dict)
         ]
+
+        # Parse progressive fixes (optimization #3)
+        for pf in payload.get("progressive_fixes", []):
+            if isinstance(pf, dict):
+                fix = _parse_progressive_fix(pf)
+                if fix:
+                    report.progressive_fixes.append(fix)
+
+        # Parse version evolution (optimization #4)
+        for ve in payload.get("version_evolution", []):
+            if isinstance(ve, dict):
+                evo = _parse_version_evolution(ve)
+                if evo:
+                    report.version_evolution.append(evo)
 
         # Legacy fallback: also parse old "note_enhancements" / "notes" fields
         # and convert them into detailed_notes for backward compatibility
@@ -1250,10 +1413,156 @@ def chunk_result_path(output_dir: Path, repo: str, target_tag: str, idx: int) ->
     return output_dir / filename
 
 
+def _generate_enhancement_prompt(
+    merged: Dict[str, Any],
+    themes_map: Dict[str, Dict[str, Any]],
+    detailed_map: Dict[str, Dict[str, Any]],
+    lang: str = "zh",
+) -> str:
+    """Generate an enhancement prompt for LLM to improve merged results.
+
+    When the pure-Python merge produces generic executive_summary or empty
+    developer_conclusion/compatibility_risks/test_points, this prompt
+    provides all theme and note summaries so the LLM can synthesize
+    high-quality content without re-analyzing raw data.
+    """
+    es = merged.get("executive_summary", {})
+    dc = merged.get("developer_conclusion", "")
+    cr_list = merged.get("compatibility_risks", [])
+    tp_list = merged.get("test_points", [])
+
+    # Determine what needs enhancement
+    needs = []
+    theme_text = es.get("theme", "")
+    generic_markers = ["多个", "various", "multiple", "miscellaneous", "杂项", "其他"]
+    is_generic_theme = any(m in theme_text for m in generic_markers) or len(theme_text) < 5
+    if is_generic_theme:
+        needs.append("executive_summary.theme")
+    if not es.get("one_liner"):
+        needs.append("executive_summary.one_liner")
+    if not dc or len(str(dc)) < 15:
+        needs.append("developer_conclusion")
+    high_risk_themes = [t for t in themes_map.values() if t.get("risk_level") == "high"]
+    if not cr_list and high_risk_themes:
+        needs.append("compatibility_risks")
+    breaking_themes = [t for t in themes_map.values() if t.get("primary_category") in ("breaking", "security")]
+    if not tp_list and (breaking_themes or high_risk_themes):
+        needs.append("test_points")
+
+    # Build theme summaries
+    theme_lines = []
+    for tid, t in sorted(themes_map.items()):
+        theme_lines.append(
+            f"{tid}: {t.get('theme_name', '')} | risk={t.get('risk_level', 'low')} | "
+            f"category={t.get('primary_category', 'other')} | notes={len(t.get('note_ids', []))} | "
+            f"summary={t.get('summary', '')}"
+        )
+
+    # Build high-risk theme details
+    hr_lines = []
+    for t in sorted(high_risk_themes, key=lambda x: len(x.get("note_ids", [])), reverse=True):
+        hr_lines.append(
+            f"- {t.get('theme_id', '')} '{t.get('theme_name', '')}': {t.get('impact', '')} "
+            f"(commits: {', '.join(t.get('related_commits', []))})"
+        )
+
+    # Build detailed note summaries (high risk only)
+    dn_lines = []
+    for nid, dn in sorted(detailed_map.items()):
+        if dn.get("risk_level") == "high":
+            interp = dn.get("interpretation", "")
+            dn_lines.append(
+                f"- {nid} [{dn.get('component', '')}]: {interp[:120]}{'...' if len(interp) > 120 else ''}"
+            )
+
+    if lang == "zh":
+        prompt = (
+            "==== 合并后增强任务 ====\n\n"
+            f"以下是从 {len(themes_map)} 个 themes 和 {len(detailed_map)} 条详细分析中合并得到的结果。"
+            f"合并步骤（纯 Python，无 LLM）已经生成了初步结果，但以下字段需要增强：\n"
+            f"需要增强的字段: {', '.join(needs) if needs else 'executive_summary, developer_conclusion, compatibility_risks, test_points'}\n\n"
+            "=== Themes 摘要 ===\n"
+            + "\n".join(theme_lines)
+            + "\n\n=== 高风险 Themes 详情 ===\n"
+            + ("\n".join(hr_lines) if hr_lines else "(无)")
+            + "\n\n=== 高风险 Detailed Notes 摘要 ===\n"
+            + ("\n".join(dn_lines) if dn_lines else "(无)")
+            + "\n\n=== 任务 ===\n"
+            "请基于以上 themes 和 notes 的摘要信息，生成以下增强内容（JSON 格式）：\n\n"
+            "{\n"
+            '  "executive_summary": {\n'
+            '    "recommendation": "建议升级/谨慎升级/暂缓升级",\n'
+            '    "theme": "15字以内的核心主题，要具体不要泛化",\n'
+            '    "magnitude": "大/中/小",\n'
+            '    "reason": "50字以内的建议理由",\n'
+            '    "top_changes": [\n'
+            '      {"note_id": "R-xxx", "text": "变化摘要", "risk": "high/medium/low", "categories": ["breaking", "security"]}\n'
+            '    ],\n'
+            '    "one_liner": "一句话判断"\n'
+            '  },\n'
+            '  "developer_conclusion": "面向 Channel/插件开发者的一句话结论（50字以内），要具体",\n'
+            '  "compatibility_risks": [\n'
+            '    {"component": "组件名", "description": "具体的兼容性风险描述"}\n'
+            '  ],\n'
+            '  "test_points": [\n'
+            '    "具体的可操作的测试建议"\n'
+            '  ]\n'
+            "}\n\n"
+            "要求：\n"
+            "1. theme 必须具体，不能是\"多个主题变更\"这种泛化描述\n"
+            "2. developer_conclusion 必须具体，例如\"Feishu 认证从 QR 改为手动配置，需要重新绑定\"\n"
+            "3. compatibility_risks 每条必须说明\"什么会 break、为什么、怎么验证\"\n"
+            "4. test_points 每条必须是可操作的验证步骤\n"
+            "5. 只输出 JSON，不要 markdown 代码块包裹"
+        )
+    else:
+        prompt = (
+            "==== Post-Merge Enhancement Task ====\n\n"
+            f"Below are {len(themes_map)} themes and {len(detailed_map)} detailed notes merged from chunk results. "
+            f"The merge step (pure Python, no LLM) produced preliminary results, but the following fields need enhancement:\n"
+            f"Fields needing enhancement: {', '.join(needs) if needs else 'executive_summary, developer_conclusion, compatibility_risks, test_points'}\n\n"
+            "=== Theme Summaries ===\n"
+            + "\n".join(theme_lines)
+            + "\n\n=== High-Risk Theme Details ===\n"
+            + ("\n".join(hr_lines) if hr_lines else "(none)")
+            + "\n\n=== High-Risk Detailed Note Summaries ===\n"
+            + ("\n".join(dn_lines) if dn_lines else "(none)")
+            + "\n\n=== Task ===\n"
+            "Please generate the following enhanced content based on the theme and note summaries above (JSON format):\n\n"
+            "{\n"
+            '  "executive_summary": {\n'
+            '    "recommendation": "Recommend Upgrade / Upgrade with Caution / Defer",\n'
+            '    "theme": "Core theme within 15 words, be specific not generic",\n'
+            '    "magnitude": "Large / Medium / Small",\n'
+            '    "reason": "Rationale within 50 words",\n'
+            '    "top_changes": [\n'
+            '      {"note_id": "R-xxx", "text": "Change summary", "risk": "high/medium/low", "categories": ["breaking", "security"]}\n'
+            '    ],\n'
+            '    "one_liner": "One-sentence judgment"\n'
+            '  },\n'
+            '  "developer_conclusion": "One-sentence conclusion for channel/plugin developers (within 50 words), be specific",\n'
+            '  "compatibility_risks": [\n'
+            '    {"component": "Component name", "description": "Specific compatibility risk description"}\n'
+            '  ],\n'
+            '  "test_points": [\n'
+            '    "Specific actionable test recommendation"\n'
+            '  ]\n'
+            "}\n\n"
+            "Requirements:\n"
+            '1. theme must be specific, not generic like "multiple theme changes"\n'
+            "2. developer_conclusion must be specific\n"
+            '3. compatibility_risks must explain "WHAT will break, WHY, and HOW to verify"\n'
+            "4. test_points must be actionable verification steps\n"
+            "5. Output JSON only, no markdown code block wrapper"
+        )
+
+    return prompt
+
+
 def merge_chunk_results(
     chunk_result_paths: List[Path],
     output_path: Path,
-) -> None:
+) -> Dict[str, Any]:
     """Merge multiple chunk LLM results into a single llm-results.json.
 
     Merging rules:
@@ -1264,6 +1573,11 @@ def merge_chunk_results(
     - shadow_changes: Concatenate all, remove duplicates by description.
     - executive_summary: Generated from first chunk or synthesized from merged themes.
     - developer_conclusion: From first chunk.
+
+    Returns a dict with enhancement info:
+    - enhancement_needed: bool
+    - enhancement_prompt_path: Path (if enhancement_needed)
+    - needs_fields: List[str] (fields that need enhancement)
     """
     if not chunk_result_paths:
         raise RuntimeError("No chunk result paths provided for merging")
@@ -1280,6 +1594,15 @@ def merge_chunk_results(
 
     if not chunks:
         raise RuntimeError("No valid chunk results found")
+
+    # Detect language from first chunk's themes
+    lang = "zh"
+    first_themes = chunks[0].get("themes", [])
+    if first_themes and isinstance(first_themes[0], dict):
+        tn = first_themes[0].get("theme_name", "")
+        # Simple heuristic: if theme name has Chinese characters, use zh
+        if not any("一" <= c <= "鿿" for c in tn):
+            lang = "en"
 
     # Merge themes by theme_id
     themes_map: Dict[str, Dict[str, Any]] = {}
@@ -1354,6 +1677,73 @@ def merge_chunk_results(
                     shadow_seen.add(desc)
                     shadow_changes.append(sc)
 
+    # Merge progressive_fixes by fix_id (optimization #3)
+    progressive_fixes_map: Dict[str, Dict[str, Any]] = {}
+    for chunk in chunks:
+        for pf in chunk.get("progressive_fixes", []):
+            if not isinstance(pf, dict):
+                continue
+            fid = pf.get("fix_id", "")
+            if not fid:
+                continue
+            if fid in progressive_fixes_map:
+                # Union stages by note_id
+                existing_stages = {s.get("note_id", ""): s for s in progressive_fixes_map[fid].get("stages", []) if isinstance(s, dict)}
+                for s in pf.get("stages", []):
+                    if isinstance(s, dict):
+                        nid = s.get("note_id", "")
+                        if nid and nid not in existing_stages:
+                            existing_stages[nid] = s
+                progressive_fixes_map[fid]["stages"] = list(existing_stages.values())
+                # Use higher final_status: mitigated < partially_fixed < fully_fixed
+                status_rank = {"fully_fixed": 3, "partially_fixed": 2, "mitigated": 1}
+                old_status = progressive_fixes_map[fid].get("final_status", "")
+                new_status = pf.get("final_status", "")
+                if status_rank.get(new_status, 0) > status_rank.get(old_status, 0):
+                    progressive_fixes_map[fid]["final_status"] = new_status
+                # Union affected_components
+                old_comps = set(progressive_fixes_map[fid].get("affected_components", []))
+                new_comps = [c for c in pf.get("affected_components", []) if c not in old_comps]
+                progressive_fixes_map[fid]["affected_components"] = list(old_comps) + new_comps
+            else:
+                progressive_fixes_map[fid] = dict(pf)
+
+    # Merge version_evolution by evolution_id (optimization #4)
+    version_evolution_map: Dict[str, Dict[str, Any]] = {}
+    for chunk in chunks:
+        for ve in chunk.get("version_evolution", []):
+            if not isinstance(ve, dict):
+                continue
+            eid = ve.get("evolution_id", "")
+            if not eid:
+                continue
+            if eid in version_evolution_map:
+                # Use higher cumulative_risk
+                risk_rank = {"high": 3, "medium": 2, "low": 1}
+                old_risk = version_evolution_map[eid].get("cumulative_risk", "low")
+                new_risk = ve.get("cumulative_risk", "low")
+                if risk_rank.get(new_risk, 0) > risk_rank.get(old_risk, 0):
+                    version_evolution_map[eid]["cumulative_risk"] = new_risk
+                # Union affected_versions
+                old_versions = set(version_evolution_map[eid].get("affected_versions", []))
+                new_versions = [v for v in ve.get("affected_versions", []) if v not in old_versions]
+                version_evolution_map[eid]["affected_versions"] = list(old_versions) + new_versions
+                # Union related_themes
+                old_themes = set(version_evolution_map[eid].get("related_themes", []))
+                new_themes = [t for t in ve.get("related_themes", []) if t not in old_themes]
+                version_evolution_map[eid]["related_themes"] = list(old_themes) + new_themes
+                # Union affected_components
+                old_comps = set(version_evolution_map[eid].get("affected_components", []))
+                new_comps = [c for c in ve.get("affected_components", []) if c not in old_comps]
+                version_evolution_map[eid]["affected_components"] = list(old_comps) + new_comps
+                # Prefer longer risk_escalation_reason
+                old_reason = version_evolution_map[eid].get("risk_escalation_reason", "")
+                new_reason = ve.get("risk_escalation_reason", "")
+                if len(new_reason) > len(old_reason):
+                    version_evolution_map[eid]["risk_escalation_reason"] = new_reason
+            else:
+                version_evolution_map[eid] = dict(ve)
+
     # Executive summary: prefer from first chunk, or synthesize
     first_es = chunks[0].get("executive_summary", {})
     if isinstance(first_es, dict) and first_es.get("top_changes"):
@@ -1389,10 +1779,42 @@ def merge_chunk_results(
         "compatibility_risks": compat_risks,
         "test_points": test_points,
         "shadow_changes": shadow_changes,
+        "progressive_fixes": list(progressive_fixes_map.values()),
+        "version_evolution": list(version_evolution_map.values()),
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Check if enhancement is needed and generate enhancement prompt
+    enhancement_prompt = _generate_enhancement_prompt(merged, themes_map, detailed_map, lang)
+    needs = []
+    es = merged.get("executive_summary", {})
+    theme_text = es.get("theme", "")
+    generic_markers = ["多个", "various", "multiple", "miscellaneous", "杂项", "其他"]
+    if any(m in theme_text for m in generic_markers) or len(theme_text) < 5:
+        needs.append("executive_summary.theme")
+    if not es.get("one_liner"):
+        needs.append("executive_summary.one_liner")
+    if not developer_conclusion or len(str(developer_conclusion)) < 15:
+        needs.append("developer_conclusion")
+    hr_themes = [t for t in themes_map.values() if t.get("risk_level") == "high"]
+    if not compat_risks and hr_themes:
+        needs.append("compatibility_risks")
+    br_themes = [t for t in themes_map.values() if t.get("primary_category") in ("breaking", "security")]
+    if not test_points and (br_themes or hr_themes):
+        needs.append("test_points")
+
+    if needs:
+        prompt_path = output_path.with_suffix(".enhancement-prompt.txt")
+        prompt_path.write_text(enhancement_prompt, encoding="utf-8")
+        return {
+            "enhancement_needed": True,
+            "enhancement_prompt_path": prompt_path,
+            "needs_fields": needs,
+        }
+
+    return {"enhancement_needed": False, "needs_fields": []}
 
 
 def discover_chunk_results(snapshot_dir: Path, repo: str, target_tag: str) -> List[Path]:

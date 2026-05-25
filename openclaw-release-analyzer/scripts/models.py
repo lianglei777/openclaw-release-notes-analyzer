@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -44,6 +44,7 @@ class ChangeAnalysis:
     llm_enhanced: bool = False
     code_evidence: str = ""
     llm_reasoning: str = ""
+    note_id: str = ""
 
 
 def normalize_version(value: str) -> str:
@@ -124,6 +125,39 @@ class LLMNoteAnalysis:
 
 
 @dataclass
+class ProgressiveFix:
+    """A progressive fix chain detected across multiple versions.
+
+    Represents an issue that was addressed incrementally across releases,
+    e.g., partial mitigation in v1 → refinement in v2 → complete fix in v3.
+    """
+    fix_id: str = ""
+    issue_description: str = ""
+    stages: List[Dict[str, Any]] = field(default_factory=list)
+    final_status: str = ""  # "fully_fixed", "partially_fixed", "mitigated"
+    impact_assessment: str = ""
+    affected_components: List[str] = field(default_factory=list)
+
+
+@dataclass
+class VersionEvolution:
+    """Cumulative breaking change assessment across a version range.
+
+    Captures cases where individual versions appear low-risk but the
+    aggregate impact across the upgrade path is high.
+    """
+    evolution_id: str = ""
+    description: str = ""
+    affected_versions: List[str] = field(default_factory=list)
+    individual_risk: str = "low"  # per-version risk
+    cumulative_risk: str = "low"  # aggregate risk across the range
+    risk_escalation_reason: str = ""  # why cumulative > individual
+    related_themes: List[str] = field(default_factory=list)
+    affected_components: List[str] = field(default_factory=list)
+    migration_advice: str = ""
+
+
+@dataclass
 class LLMFullReport:
     """Complete analysis report produced by LLM.
 
@@ -137,6 +171,9 @@ class LLMFullReport:
     compatibility_risks: List[LLMCompatibilityRisk] = field(default_factory=list)
     test_points: List[str] = field(default_factory=list)
     shadow_changes: List[Dict[str, Any]] = field(default_factory=list)
+    # Cross-version upgrade analysis (optimizations #3 and #4)
+    progressive_fixes: List[ProgressiveFix] = field(default_factory=list)
+    version_evolution: List[VersionEvolution] = field(default_factory=list)
 
 
 def is_prerelease_name(*values: str) -> bool:

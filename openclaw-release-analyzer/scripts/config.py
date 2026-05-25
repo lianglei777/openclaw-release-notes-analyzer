@@ -348,6 +348,55 @@ CHUNK_RESULT_PATTERN = "{repo}-{target}-analysis-result-chunk-{idx:03d}.json"
 LLM_RESULTS_TTL_DAYS = 7
 RELEASE_NOTES_MAX_VERSIONS = 20
 
+# ---------------------------------------------------------------------------
+# Semantic deduplication settings
+# ---------------------------------------------------------------------------
+
+# Stop words removed when building semantic deduplication signatures.
+# These are common English and Chinese words that don't help distinguish
+# between different changes. Words shorter than this are also removed.
+SEMANTIC_DEDUP_STOP_WORDS: set[str] = {
+    # English
+    "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "up", "about", "into", "through", "during",
+    "before", "after", "above", "below", "between", "among", "is", "are",
+    "was", "were", "be", "been", "being", "have", "has", "had", "do", "does",
+    "did", "will", "would", "could", "should", "may", "might", "must", "can",
+    "this", "that", "these", "those", "i", "you", "he", "she", "it", "we",
+    "they", "me", "him", "her", "us", "them", "my", "your", "his", "its",
+    "our", "their", "am", "was", "were", "s", "t", "just", "don", "now",
+    "ll", "m", "o", "re", "ve", "y", "ma", "d", "ll", "won", "ain",
+    # Conventional-commit prefixes (already implied by structure)
+    "fix", "feat", "chore", "docs", "refactor", "perf", "test", "build",
+    "ci", "style", "revert", "update", "add", "remove", "support",
+    "improve", "enhance", "change", "use", "using", "new", "adds",
+    "fixes", "updates", "removes", "changed", "improved", "enhanced",
+    "supported", "added", "removed", "fixed", "updated",
+    # Common verbs/adverbs
+    "when", "where", "what", "how", "why", "who", "which", "if", "then",
+    "else", "also", "too", "very", "much", "many", "more", "most", "some",
+    "any", "all", "none", "no", "not", "only", "just", "still", "already",
+    "yet", "even", "so", "such", "than", "as", "like", "per", "via",
+    "over", "under", "again", "further", "once", "here", "there", "other",
+    "another", "each", "every", "both", "either", "neither", "one", "two",
+    "first", "last", "next", "previous", "same", "different",
+    # Chinese stop words
+    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人",
+    "都", "一", "一个", "上", "也", "很", "到", "说", "要", "去",
+    "你", "会", "着", "没有", "看", "好", "自己", "这", "那",
+}
+
+# Minimum number of signature words for semantic dedup to trigger.
+# Signatures shorter than this are considered too generic and are ignored.
+SEMANTIC_DEDUP_MIN_WORDS = 3
+
+# Similarity threshold for semantic dedup (0.0-1.0).
+# Two items with similarity >= this value are considered duplicates.
+# 0.80 is chosen to catch the same change described with slightly different
+# wording (e.g. commit-SHA prefix, author mention, minor wording variation)
+# while avoiding false positives for genuinely different changes.
+SEMANTIC_DEDUP_THRESHOLD = 0.80
+
 
 # ---------------------------------------------------------------------------
 # Path helpers

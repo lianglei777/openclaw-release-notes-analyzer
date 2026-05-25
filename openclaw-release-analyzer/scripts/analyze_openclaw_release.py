@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -29,6 +30,9 @@ from config import (
     MAX_TOTAL_DIFF_CHARS,
     SECTION_HINTS,
     ZH_KEYWORDS,
+    SEMANTIC_DEDUP_STOP_WORDS,
+    SEMANTIC_DEDUP_MIN_WORDS,
+    SEMANTIC_DEDUP_THRESHOLD,
     default_cache_dir,
     LLM_RESULTS_TTL_DAYS,
     RELEASE_NOTES_MAX_VERSIONS,
@@ -229,6 +233,328 @@ def read_release_snapshot(path: Path) -> List[Release]:
     if not match:
         raise RuntimeError(f"Snapshot is missing release payload: {path}")
     return decode_release_payload(match.group(1))
+
+
+# ---------------------------------------------------------------------------
+# Cache consistency verification
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ConsistencyReport:
+    """Result of a cache consistency verification check."""
+
+    is_valid: bool = True
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+
+def _extract_frontmatter(path: Path) -> Dict[str, str]:
+    """Extract frontmatter key-value pairs from a snapshot file."""
+    text = path.read_text(encoding="utf-8")
+    fm_match = re.search(r"^---\s*\n(.*?)\n---", text, re.DOTALL | re.MULTILINE)
+    if not fm_match:
+        return {}
+    result: Dict[str, str] = {}
+    for line in fm_match.group(1).splitlines():
+        # Match key: value format (skip list items and nested structures)
+        m = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)$", line)
+        if m:
+            result[m.group(1)] = m.group(2).strip()
+    return result
+
+
+def verify_snapshot_structure(path: Path) -> ConsistencyReport:
+    """Check snapshot file structure integrity.
+
+    Verifies:
+    - File exists and is non-empty
+    - Frontmatter contains all required fields
+    - Body contains headings for each scoped release
+    """
+    report = ConsistencyReport()
+
+    if not path.exists():
+        report.is_valid = False
+        report.errors.append(f"Snapshot file does not exist: {path}")
+        return report
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        report.is_valid = False
+        report.errors.append(f"Cannot read snapshot file: {exc}")
+        return report
+
+    if not text.strip():
+        report.is_valid = False
+        report.errors.append("Snapshot file is empty")
+        return report
+
+    # Check frontmatter presence
+    if not text.startswith("---"):
+        report.is_valid = False
+        report.errors.append("Missing frontmatter delimiter")
+        return report
+
+    fm = _extract_frontmatter(path)
+    required_fields = [
+        "repo", "target_version", "source_url",
+        "fetched_at", "release_published_at", "scoped_releases",
+        "release_payload_base64",
+    ]
+    missing = [f for f in required_fields if f not in fm]
+    if missing:
+        report.is_valid = False
+        report.errors.append(f"Missing required frontmatter fields: {', '.join(missing)}")
+
+    # Check that scoped_releases are present in body headings
+    scoped_tags_str = fm.get("scoped_releases", "")
+    scoped_tags = [t.strip() for t in scoped_tags_str.split(",") if t.strip()]
+    for tag in scoped_tags:
+        if f"# {tag}" not in text:
+            report.is_valid = False
+            report.errors.append(f"Missing body section for scoped release: {tag}")
+
+    # Warn if snapshot is very old (> 7 days)
+    fetched_at = fm.get("fetched_at", "")
+    if fetched_at:
+        try:
+            fetched_dt = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+            age_days = (datetime.now(timezone.utc) - fetched_dt).total_seconds() / 86400
+            if age_days > 7:
+                report.warnings.append(f"Snapshot is {age_days:.1f} days old")
+        except ValueError:
+            report.warnings.append(f"Cannot parse fetched_at timestamp: {fetched_at}")
+
+    return report
+
+
+def verify_snapshot_payload(path: Path) -> ConsistencyReport:
+    """Check that the base64 payload is consistent with frontmatter metadata.
+
+    Verifies:
+    - Payload is decodable
+    - Payload contains releases for all scoped tags
+    - Payload contains the target version
+    """
+    report = ConsistencyReport()
+    fm = _extract_frontmatter(path)
+
+    target_version = fm.get("target_version", "")
+    scoped_tags_str = fm.get("scoped_releases", "")
+    scoped_tags = [t.strip() for t in scoped_tags_str.split(",") if t.strip()]
+
+    try:
+        releases = read_release_snapshot(path)
+    except Exception as exc:
+        report.is_valid = False
+        report.errors.append(f"Cannot decode release payload: {exc}")
+        return report
+
+    if not releases:
+        report.is_valid = False
+        report.errors.append("Decoded payload contains no releases")
+        return report
+
+    payload_tags = {r.tag_name for r in releases}
+
+    # Verify all scoped tags exist in payload
+    for tag in scoped_tags:
+        if tag not in payload_tags:
+            report.is_valid = False
+            report.errors.append(f"Scoped release '{tag}' not found in payload")
+
+    # Verify target version exists in payload
+    if target_version and target_version not in payload_tags:
+        report.is_valid = False
+        report.errors.append(f"Target version '{target_version}' not found in payload")
+
+    # Sanity check: payload should have reasonable number of releases
+    if len(releases) < len(scoped_tags):
+        report.is_valid = False
+        report.errors.append(
+            f"Payload has fewer releases ({len(releases)}) than scoped tags ({len(scoped_tags)})"
+        )
+
+    return report
+
+
+def verify_snapshot_freshness(
+    snapshot_releases: List[Release],
+    fresh_releases: List[Release],
+    target_tag: str,
+    is_latest_mode: bool,
+) -> ConsistencyReport:
+    """Check if cached snapshot is still fresh compared to live GitHub data.
+
+    Verifies:
+    - For --latest mode: cached target is still the latest stable release
+    - Target version still exists on GitHub
+    - Target published_at hasn't changed
+    """
+    report = ConsistencyReport()
+
+    if not fresh_releases:
+        report.warnings.append("Cannot verify freshness: no live data available")
+        return report
+
+    # Find the target in both datasets
+    snap_target = find_release(snapshot_releases, target_tag)
+    fresh_target = find_release(fresh_releases, target_tag)
+
+    if not snap_target:
+        report.is_valid = False
+        report.errors.append(f"Target version '{target_tag}' not found in snapshot")
+        return report
+
+    if not fresh_target:
+        report.is_valid = False
+        report.errors.append(
+            f"Target version '{target_tag}' no longer exists on GitHub; snapshot is stale"
+        )
+        return report
+
+    # Check published_at hasn't changed (indicates release was edited/republished)
+    if snap_target.published_at != fresh_target.published_at:
+        report.is_valid = False
+        report.errors.append(
+            f"Release {target_tag} published_at changed: "
+            f"snapshot={snap_target.published_at}, live={fresh_target.published_at}"
+        )
+
+    # For latest mode: check if target is still the latest stable
+    if is_latest_mode:
+        fresh_stable = stable_releases(fresh_releases)
+        if fresh_stable:
+            latest_stable = fresh_stable[0]
+            if latest_stable.tag_name != target_tag:
+                report.is_valid = False
+                report.errors.append(
+                    f"Newer stable release available: {latest_stable.tag_name} "
+                    f"(cached: {target_tag})"
+                )
+
+    return report
+
+
+def verify_llm_results_consistency(
+    results_path: Path,
+    snapshot_path: Path,
+) -> ConsistencyReport:
+    """Check that LLM results are consistent with the associated snapshot.
+
+    Verifies:
+    - Results file exists and is valid JSON
+    - Results reference versions that exist in the snapshot
+    - Results file is not older than the snapshot
+    """
+    report = ConsistencyReport()
+
+    if not results_path.exists():
+        report.is_valid = False
+        report.errors.append(f"LLM results file does not exist: {results_path}")
+        return report
+
+    try:
+        results_text = results_path.read_text(encoding="utf-8")
+        results = json.loads(results_text)
+    except json.JSONDecodeError as exc:
+        report.is_valid = False
+        report.errors.append(f"LLM results file is not valid JSON: {exc}")
+        return report
+    except Exception as exc:
+        report.is_valid = False
+        report.errors.append(f"Cannot read LLM results file: {exc}")
+        return report
+
+    # Try to extract version references from results
+    # The LLM results should contain release_tag references in detailed_notes
+    detailed_notes = results.get("detailed_notes", [])
+    result_tags: set[str] = set()
+    for note in detailed_notes:
+        tag = note.get("release_tag", "") if isinstance(note, dict) else ""
+        if tag:
+            result_tags.add(tag)
+
+    # If no tags found, results might be from a different format — just warn
+    if not result_tags:
+        report.warnings.append("No version tags found in LLM results; cannot verify version alignment")
+
+    # Check that results are newer than snapshot (results should be generated after snapshot)
+    if snapshot_path.exists() and results_path.exists():
+        try:
+            snap_mtime = snapshot_path.stat().st_mtime
+            results_mtime = results_path.stat().st_mtime
+            if results_mtime < snap_mtime:
+                report.is_valid = False
+                report.errors.append(
+                    f"LLM results ({results_path.name}) are older than snapshot "
+                    f"({snapshot_path.name}); results may be stale"
+                )
+        except OSError:
+            pass
+
+    return report
+
+
+def run_full_consistency_check(
+    snapshot_path: Path,
+    args: argparse.Namespace,
+    fresh_releases: Optional[List[Release]] = None,
+    llm_results_path: Optional[Path] = None,
+) -> ConsistencyReport:
+    """Run all consistency checks and return a consolidated report.
+
+    Execution order: structure → payload → freshness → llm_results.
+    Early failures do not skip later checks; all errors are collected.
+    """
+    report = ConsistencyReport()
+
+    # 1. Structure check
+    struct_report = verify_snapshot_structure(snapshot_path)
+    report.errors.extend(struct_report.errors)
+    report.warnings.extend(struct_report.warnings)
+    if not struct_report.is_valid:
+        report.is_valid = False
+
+    # 2. Payload check (only if structure is valid enough to parse)
+    if struct_report.is_valid or not any("does not exist" in e for e in struct_report.errors):
+        payload_report = verify_snapshot_payload(snapshot_path)
+        report.errors.extend(payload_report.errors)
+        report.warnings.extend(payload_report.warnings)
+        if not payload_report.is_valid:
+            report.is_valid = False
+
+    # 3. Freshness check (requires live data)
+    is_latest_mode = not args.target and not args.from_version and not args.to_version
+    if fresh_releases and snapshot_path.exists():
+        try:
+            snapshot_releases = read_release_snapshot(snapshot_path)
+            target_tag = args.target
+            if not target_tag and snapshot_releases:
+                # Infer target from snapshot frontmatter
+                fm = _extract_frontmatter(snapshot_path)
+                target_tag = fm.get("target_version", "")
+            if target_tag:
+                freshness_report = verify_snapshot_freshness(
+                    snapshot_releases, fresh_releases, target_tag, is_latest_mode
+                )
+                report.errors.extend(freshness_report.errors)
+                report.warnings.extend(freshness_report.warnings)
+                if not freshness_report.is_valid:
+                    report.is_valid = False
+        except Exception as exc:
+            report.warnings.append(f"Could not verify freshness: {exc}")
+
+    # 4. LLM results consistency check
+    if llm_results_path:
+        llm_report = verify_llm_results_consistency(llm_results_path, snapshot_path)
+        report.errors.extend(llm_report.errors)
+        report.warnings.extend(llm_report.warnings)
+        if not llm_report.is_valid:
+            report.is_valid = False
+
+    return report
 
 
 def refresh_snapshot_and_load(args: argparse.Namespace) -> Tuple[Release, Optional[Release], List[Release], List[Release], Path]:
@@ -464,6 +790,129 @@ def normalize_item_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"\s+by\s+@[-\w]+\.?$", ".", text, flags=re.IGNORECASE)
     return text
+
+
+# ---------------------------------------------------------------------------
+# Semantic deduplication for cross-version analysis
+# ---------------------------------------------------------------------------
+
+# Pre-compile regexes for performance
+_COMMIT_SHA_PREFIX_RE = re.compile(r'^[a-f0-9]{7,}\s*[:,-]\s*')
+_AUTHOR_REF_RE = re.compile(r'\s+by\s+@[-\w]+', re.IGNORECASE)
+_AT_MENTION_RE = re.compile(r'@\w+')
+_URL_RE = re.compile(r'https?://\S+')
+_PUNCT_RE = re.compile(r'[^\w\s]')
+_WHITESPACE_RE = re.compile(r'\s+')
+
+
+# Common abbreviations mapped to canonical forms for normalization.
+# This prevents the same concept expressed as abbreviation vs full form
+# from producing different signatures (e.g. "compat" vs "compatibility").
+_ABBREV_MAP: dict[str, str] = {
+    "compat": "compatibility",
+    "perf": "performance",
+    "auth": "authentication",
+    "authn": "authentication",
+    "authz": "authorization",
+    "config": "configuration",
+    "dep": "dependency",
+    "deps": "dependencies",
+    "ref": "reference",
+    "refs": "references",
+    "init": "initialize",
+    "err": "error",
+    "msg": "message",
+    "param": "parameter",
+    "params": "parameters",
+    "func": "function",
+    "fn": "function",
+    "prop": "property",
+    "props": "properties",
+    "ctx": "context",
+    "str": "string",
+    "num": "number",
+    "bool": "boolean",
+    "obj": "object",
+    "arr": "array",
+    "pkg": "package",
+    "lib": "library",
+    "mod": "module",
+    "util": "utility",
+    "utils": "utilities",
+    "dir": "directory",
+    "dirs": "directories",
+    "env": "environment",
+    "tmp": "temporary",
+    "temp": "temporary",
+    "opts": "options",
+    "args": "arguments",
+    "cli": "command_line_interface",
+}
+
+
+def semantic_dedup_key(text: str) -> str:
+    """Generate a normalized semantic signature for cross-version deduplication.
+
+    The signature is built by:
+    1. Removing commit-SHA prefixes, author references, URLs, and punctuation.
+    2. Lowercasing and splitting into words.
+    3. Expanding abbreviations to canonical forms.
+    4. Removing stop words.
+    5. Keeping words >= 3 chars OR pure numeric tokens (version numbers).
+    6. Sorting the remaining words alphabetically and joining with spaces.
+
+    Two release-note items with the same signature are considered semantically
+    identical, even if their raw text differs slightly (e.g. due to different
+    commit-SHA prefixes, author mentions, or minor wording variations).
+    """
+    # Remove commit SHA prefix (e.g. "abc1234: fix memory leak")
+    text = _COMMIT_SHA_PREFIX_RE.sub('', text)
+    # Remove author references
+    text = _AUTHOR_REF_RE.sub('', text)
+    text = _AT_MENTION_RE.sub('', text)
+    # Remove URLs
+    text = _URL_RE.sub('', text)
+    # Lowercase
+    text = text.lower()
+    # Remove punctuation, keep only words, spaces, and digits
+    text = _PUNCT_RE.sub(' ', text)
+    # Normalize whitespace
+    text = _WHITESPACE_RE.sub(' ', text).strip()
+    # Build word list: keep words >= 3 chars, pure numbers, and abbreviations
+    words: list[str] = []
+    for w in text.split():
+        # Expand known abbreviations
+        if w in _ABBREV_MAP:
+            w = _ABBREV_MAP[w]
+        # Keep if: not a stop word AND (>= 3 chars OR pure numeric)
+        if w not in SEMANTIC_DEDUP_STOP_WORDS and (len(w) >= 3 or w.isdigit()):
+            words.append(w)
+    # Sort to ensure consistent signatures regardless of word order
+    return ' '.join(sorted(words))
+
+
+def items_are_semantically_similar(a: str, b: str, threshold: float = SEMANTIC_DEDUP_THRESHOLD) -> bool:
+    """Return True if two release-note items are semantically similar.
+
+    Uses Jaccard similarity on word sets derived from semantic signatures.
+    This is more robust than character-level SequenceMatcher for short
+    release-note texts where the same change may be described with slightly
+    different wording across versions (e.g. cherry-picks with edited
+    commit messages, different prefixes, or added author mentions).
+    """
+    words_a = set(semantic_dedup_key(a).split())
+    words_b = set(semantic_dedup_key(b).split())
+    # Short signatures are too generic; require minimum word count
+    if len(words_a) < SEMANTIC_DEDUP_MIN_WORDS or len(words_b) < SEMANTIC_DEDUP_MIN_WORDS:
+        return False
+    if not words_a or not words_b:
+        return False
+    intersection = words_a & words_b
+    union = words_a | words_b
+    if not union:
+        return False
+    jaccard = len(intersection) / len(union)
+    return jaccard >= threshold
 
 
 def primary_category(scores: Dict[str, int], section: Optional[str] = None) -> str:
@@ -833,17 +1282,86 @@ def analyze_change_item(item: str, release: Release, lang: str) -> ChangeAnalysi
     )
 
 
+# Module-level: statistics from the last analyze_release_notes call
+_last_dedup_stats: dict[str, int] = {}
+
+
+def get_last_dedup_stats() -> dict[str, int]:
+    """Return deduplication stats from the last analyze_release_notes call."""
+    return _last_dedup_stats.copy()
+
+
 def analyze_release_notes(scoped: Sequence[Release], lang: str) -> List[ChangeAnalysis]:
+    """Analyze release notes across a version scope with two-level deduplication.
+
+    Level 1 — Exact text match: items with identical normalized text are
+    deduplicated. This catches cherry-picks and verbatim duplicates.
+
+    Level 2 — Semantic signature match: items whose semantic signatures are
+    sufficiently similar (>= SEMANTIC_DEDUP_THRESHOLD) are also deduplicated.
+    This catches the same change described with slightly different wording
+    across versions (e.g. commit messages edited during cherry-pick).
+    """
+    global _last_dedup_stats
+
     analyses: List[ChangeAnalysis] = []
-    seen: set[str] = set()
+    seen_texts: set[str] = set()
+    seen_signatures: dict[str, str] = {}  # signature -> canonical text
+    exact_dups = 0
+    semantic_dups = 0
+    total_items = 0
+
     for release in scoped:
         for item in release_note_items(release):
+            total_items += 1
+
+            # Level 1: exact text dedup
             key = item.lower()
-            if key in seen:
+            if key in seen_texts:
+                exact_dups += 1
                 continue
-            seen.add(key)
+
+            # Level 2: semantic signature dedup (Jaccard similarity on word sets)
+            words = set(semantic_dedup_key(item).split())
+            if len(words) >= SEMANTIC_DEDUP_MIN_WORDS:
+                is_dup = False
+                for existing_sig, existing_text in seen_signatures.items():
+                    existing_words = set(existing_sig.split())
+                    intersection = words & existing_words
+                    union = words | existing_words
+                    if union and len(intersection) / len(union) >= SEMANTIC_DEDUP_THRESHOLD:
+                        is_dup = True
+                        break
+                if is_dup:
+                    semantic_dups += 1
+                    continue
+                seen_signatures[semantic_dedup_key(item)] = item
+
+            seen_texts.add(key)
             analyses.append(analyze_change_item(item, release, lang))
-    return sorted(analyses, key=lambda entry: entry.priority, reverse=True)
+
+    _last_dedup_stats = {
+        "total_raw_items": total_items,
+        "exact_duplicates": exact_dups,
+        "semantic_duplicates": semantic_dups,
+        "final_unique_items": len(analyses),
+        "dedup_rate": round((exact_dups + semantic_dups) / total_items * 100, 1) if total_items else 0,
+    }
+
+    # Print dedup stats to stderr for visibility (especially useful for cross-version analysis)
+    if total_items > len(analyses):
+        print(
+            f"Info: Deduplicated {exact_dups + semantic_dups} items "
+            f"({exact_dups} exact, {semantic_dups} semantic) "
+            f"out of {total_items} raw items "
+            f"→ {len(analyses)} unique ({_last_dedup_stats['dedup_rate']}% dedup rate)",
+            file=sys.stderr,
+        )
+
+    sorted_analyses = sorted(analyses, key=lambda entry: entry.priority, reverse=True)
+    for idx, analysis in enumerate(sorted_analyses, 1):
+        analysis.note_id = f"R-{idx:03d}"
+    return sorted_analyses
 
 def score_file_importance(filename: str) -> int:
     """Return an importance score for a changed file based on its path."""
@@ -1061,6 +1579,22 @@ def _cleanup_transient_files(snapshot_dir: Path, repo: str, target_tag: str) -> 
             pass
 
 
+def _cleanup_legacy_prompts(snapshot_dir: Path, repo: str, target_tag: str) -> None:
+    """Clean up only legacy prompt files, preserving base-analysis and data files.
+
+    Used in --apply-llm-results mode to keep transient files available for
+    potential re-runs while removing obsolete legacy artifacts.
+    """
+    repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
+    target_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", target_tag).strip("-") or "target"
+    pattern = f"{repo_part}-{target_part}-*-llm-prompt.json"
+    for prompt_file in snapshot_dir.glob(pattern):
+        try:
+            prompt_file.unlink()
+        except OSError:
+            pass
+
+
 def _cleanup_expired_cache(snapshot_dir: Path) -> None:
     """Remove expired cache files on startup (lazy cleanup).
 
@@ -1083,13 +1617,6 @@ def _cleanup_expired_cache(snapshot_dir: Path) -> None:
         except OSError:
             pass
 
-    # Clean up leftover analysis-data files from previous runs
-    for data_file in snapshot_dir.glob("*-analysis-data.json"):
-        try:
-            data_file.unlink()
-        except OSError:
-            pass
-
     # Clean up legacy per-component prompt files
     for prompt_file in snapshot_dir.glob("*-llm-prompt.json"):
         try:
@@ -1097,19 +1624,10 @@ def _cleanup_expired_cache(snapshot_dir: Path) -> None:
         except OSError:
             pass
 
-    # Clean up leftover base-analysis files
-    for base_file in snapshot_dir.glob("*-base-analysis.json"):
-        try:
-            base_file.unlink()
-        except OSError:
-            pass
-
-    # Clean up chunk data files from previous runs
-    for chunk_file in snapshot_dir.glob("*-analysis-chunk-*.json"):
-        try:
-            chunk_file.unlink()
-        except OSError:
-            pass
+    # NOTE: analysis-data.json, base-analysis.json, and chunk files are
+    # intermediate products tied to a specific snapshot. They are NOT cleaned
+    # here unconditionally; they are only removed when the associated snapshot
+    # is detected as inconsistent (see _cleanup_transient_files).
 
     # Keep only the most recent release notes snapshots
     snapshots = sorted(
@@ -1275,15 +1793,56 @@ def _build_categories_from_analyses(analyses: List[ChangeAnalysis]) -> Dict[str,
 
 
 def _load_snapshot_or_fetch(args: argparse.Namespace) -> Tuple[Release, Optional[Release], List[Release], List[Release], Path]:
-    """Load existing snapshot if available, otherwise fetch from GitHub API."""
+    """Load existing snapshot if available and consistent, otherwise fetch from GitHub API."""
     snapshot_dir = Path(args.snapshot_dir) if args.snapshot_dir else Path(default_cache_dir())
     # Try to find an existing snapshot for this target
     target_hint = args.target or "latest-stable"
     snapshot_path = snapshot_path_func(snapshot_dir, args.repo, target_hint)
+
     if snapshot_path.exists():
+        # Run consistency checks before trusting cached data
+        llm_results = None
+        try:
+            target_for_path = args.target or target_hint
+            llm_results = llm_results_path(snapshot_dir, args.repo, target_for_path)
+        except Exception:
+            pass
+
+        # Fetch fresh releases for freshness check (lightweight, single API call)
+        fresh_releases: Optional[List[Release]] = None
+        try:
+            fresh_releases = fetch_releases(args.repo, args.github_token)
+        except Exception:
+            pass
+
+        consistency = run_full_consistency_check(
+            snapshot_path, args, fresh_releases=fresh_releases, llm_results_path=llm_results
+        )
+
+        if not consistency.is_valid:
+            print(f"Warning: Snapshot consistency check failed for {snapshot_path.name}", file=sys.stderr)
+            for err in consistency.errors:
+                print(f"  [ERROR] {err}", file=sys.stderr)
+            for warn in consistency.warnings:
+                print(f"  [WARN]  {warn}", file=sys.stderr)
+            print("  → Cleaning up stale intermediates and re-fetching from GitHub API...", file=sys.stderr)
+            # Infer target tag from snapshot to clean up intermediates
+            try:
+                fm = _extract_frontmatter(snapshot_path)
+                stale_target = fm.get("target_version", "")
+                if stale_target:
+                    _cleanup_transient_files(snapshot_dir, args.repo, stale_target)
+            except Exception:
+                pass
+            return refresh_snapshot_and_load(args)
+
+        for warn in consistency.warnings:
+            print(f"Warning: [Snapshot] {warn}", file=sys.stderr)
+
         try:
             snapshot_releases = read_release_snapshot(snapshot_path)
             target, compare, scoped = select_scope(args, snapshot_releases)
+            print(f"Info: Using consistent cached snapshot: {snapshot_path.name}", file=sys.stderr)
             return target, compare, scoped, snapshot_releases, snapshot_path
         except Exception:
             pass  # fallback to fresh fetch
@@ -1395,7 +1954,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
             # Build single master analysis data file
             data = build_analysis_data(
-                args.repo, target, compare, analyses, commits, diff_files, _lang
+                args.repo, target, compare, analyses, commits, diff_files, _lang, scoped
             )
             data_path = analysis_data_path(snapshot_dir, args.repo, target.tag_name)
             write_analysis_data(data, data_path)
@@ -1461,9 +2020,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 1
 
             output_path = llm_results_path(snapshot_dir, args.repo, target_for_path)
-            merge_chunk_results(chunk_results, output_path)
+            enhancement_info = merge_chunk_results(chunk_results, output_path)
             print(f"CHUNK_MERGE_COMPLETE: 1")
             print(f"LLM_RESULTS: {output_path}")
+            if enhancement_info.get("enhancement_needed"):
+                print(f"ENHANCEMENT_NEEDED: 1")
+                print(f"ENHANCEMENT_PROMPT: {enhancement_info.get('enhancement_prompt_path', '')}")
+                print(f"NEEDS_FIELDS: {','.join(enhancement_info.get('needs_fields', []))}")
             return 0
 
         # -------------------------------------------------------------------
@@ -1499,6 +2062,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # Check if cached llm-results.json exists from a previous run
             results_path = llm_results_path(snapshot_dir, args.repo, target_for_path)
             if results_path.exists():
+                # Verify LLM results consistency with the associated snapshot
+                snapshot_for_results = snapshot_path_func(snapshot_dir, args.repo, target_for_path)
+                llm_consistency = verify_llm_results_consistency(results_path, snapshot_for_results)
+                if not llm_consistency.is_valid:
+                    print(
+                        f"Warning: Cached LLM results failed consistency check; discarding.",
+                        file=sys.stderr,
+                    )
+                    for err in llm_consistency.errors:
+                        print(f"  [ERROR] {err}", file=sys.stderr)
+                    try:
+                        results_path.unlink()
+                    except OSError:
+                        pass
+                    # Fall through to prepare fresh analysis data
+                    print(
+                        "Info: Valid token detected; entering LLM-enhanced analysis mode.",
+                        file=sys.stderr,
+                    )
+                    return _run_prepare_analysis_data_mode()
+                for warn in llm_consistency.warnings:
+                    print(f"Warning: [LLM Results] {warn}", file=sys.stderr)
                 print(
                     f"Info: Found cached LLM results at {results_path}; applying directly.",
                     file=sys.stderr,
@@ -1525,9 +2110,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             lang = _resolve_lang(args)
 
             # Load cached base analysis or recompute (for fallback / no-llm mode)
+            # Validate that cached base analysis matches current snapshot before reuse
             base_path = base_analysis_path(snapshot_dir, args.repo, target.tag_name)
+            analyses: List[ChangeAnalysis] = []
             if base_path.exists():
-                analyses = read_base_analysis(base_path)
+                cached_analyses = read_base_analysis(base_path)
+                cached_tags = {a.release_tag for a in cached_analyses}
+                current_tags = {r.tag_name for r in scoped}
+                if cached_tags == current_tags:
+                    analyses = cached_analyses
+                else:
+                    print(
+                        f"Warning: Cached base analysis tags mismatch "
+                        f"(cached: {sorted(cached_tags)}, current: {sorted(current_tags)}); "
+                        f"recomputing...",
+                        file=sys.stderr,
+                    )
+                    try:
+                        base_path.unlink()
+                    except OSError:
+                        pass
+                    analyses = analyze_release_notes(scoped, lang)
             else:
                 analyses = analyze_release_notes(scoped, lang)
             categories = _build_categories_from_analyses(analyses)
@@ -1560,8 +2163,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_path.write_text(report, encoding="utf-8")
             print(str(output_path))
 
-            # Clean up step-internal transient files after report generation
-            _cleanup_transient_files(snapshot_dir, args.repo, target.tag_name)
+            # P1-5: In --apply-llm-results mode, keep transient files for
+            # potential re-runs. They are cleaned up by _cleanup_expired_cache
+            # on subsequent runs or when the snapshot becomes stale.
+            _cleanup_legacy_prompts(snapshot_dir, args.repo, target.tag_name)
             return 0
 
         # Rule-based analysis only (token missing/invalid or --no-llm)

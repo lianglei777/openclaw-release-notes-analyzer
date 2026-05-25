@@ -53,6 +53,13 @@ Invoke this skill for requests such as:
   - `*-analysis-data.json`: Master analysis data for LLM (release notes + commits + diff stats). Step-internal, cleaned after report generation.
   - `*-base-analysis.json`: Rule-based analysis results (step-internal, cleaned after report generation).
   - `*-llm-results.json`: LLM analysis results (retained for 7 days to allow re-running report generation).
+- **Automatic cache consistency verification** (Optimization #7 — Cache Auto-Consistency Check):
+  - Every time a cached snapshot is loaded, the script runs a multi-layer consistency check **before** using the data.
+  - **Structure integrity**: Verifies frontmatter has all required fields (`repo`, `target_version`, `fetched_at`, `scoped_releases`, `release_payload_base64`, etc.) and body contains sections for each scoped release.
+  - **Payload consistency**: Verifies `release_payload_base64` decodes correctly, contains all scoped releases, and the target version is present.
+  - **Freshness check**: Compares cached data against live GitHub API data — detects if a newer stable release is available (in `--latest` mode), if the target version no longer exists, or if `published_at` has changed (indicating the release was edited).
+  - **LLM results consistency**: Before applying cached `llm-results.json`, verifies the file is valid JSON, not older than its associated snapshot, and references versions that exist in the snapshot.
+  - If any **error-level** check fails, the script automatically discards the inconsistent cache and re-fetches from GitHub. **Warning-level** issues (e.g., snapshot older than 7 days) are reported to stderr but do not block cache usage.
 - Snapshots are **not the final deliverable** and can be safely deleted at any time.
 - Use `--clean-cache` for manual one-shot cleanup.
 
@@ -118,7 +125,8 @@ Use one fixed data flow for every run:
    - **Linux/macOS**: `~/.cache/openclaw-release-analyzer/snapshots`
    - Override with `--snapshot-dir` only if explicitly needed.
 3. Load the snapshot back from disk.
-4. Generate the analysis report from the snapshot content only.
+4. **Verify cache consistency** (automatic, no user action required). Before using any cached snapshot or LLM results, the script performs structure integrity, payload consistency, freshness, and LLM results alignment checks. If any check fails with an error, the cached file is discarded and fresh data is fetched automatically.
+5. Generate the analysis report from the verified snapshot content only.
 
 Snapshots are intermediate cache data — they live in the system cache directory and can be safely deleted. **Snapshots are NOT the final deliverable.** The analysis report is the only file the user cares about.
 
@@ -197,14 +205,18 @@ The LLM then performs **semantic association** between release notes and commits
    When you see **CHUNKING_REQUIRED: 1**, proceed to Step 2b (chunked analysis). Otherwise, proceed to Step 2a (single analysis).
 
    The `analysis-data.json` contains three sections:
-   - `release_notes`: All notes with IDs and raw text (no pre-classification passed to LLM)
+   - `release_notes`: All notes with IDs, raw text, and `source_version` (the release tag this note originates from, e.g. `v2026.4.12`). When analyzing a version range, `source_version` enables the LLM to identify which intermediate version introduced each change, detect progressive fixes across versions, and reason about upgrade path dependencies.
    - `commits`: Top relevant commits (sha, message, author, changed files, relevance score)
    - `code_changes`: Directory-level stats + top changed files (no raw patches)
 
 2a. **Perform LLM Analysis (single chunk)** — Read the `analysis-data.json` and feed it to the LLM in a single prompt. The prompt instructs the LLM to work in three phases:
    - **Phase 1 — Thematic Clustering**: Group release notes into 8–15 semantic themes by functional intent. Each theme gets: theme name, involved note IDs, overall risk, summary, impact, related commits, affected files, and reasoning.
-   - **Phase 2 — Selective Per-Note Enhancement**: Only high-risk notes or notes with direct commit matches receive deep per-note analysis.
-   - **Phase 3 — Shadow Change Detection**: Identify commits that modify public surfaces but have no corresponding release note.
+   - **Phase 2 — Cross-Version Analysis** (when `source_version` spans multiple releases):
+     - **Progressive Fix Detection (Optimization #3)**: Identify bug/issue fix chains that span multiple versions — e.g., v1 introduces a temporary mitigation, v2 provides a partial fix, v3 completes the fix. Output each chain with stages (note_id, source_version, fix_description, completeness) and final status.
+     - **Cumulative Breaking Change Analysis (Optimization #4)**: Assess whether individual versions appear low-risk but the aggregate impact across the upgrade path is high. Output `individual_risk` vs `cumulative_risk` with a concrete `risk_escalation_reason` explaining why crossing multiple versions at once is more dangerous than upgrading step-by-step.
+     - **Version Range Annotation**: Identify which intermediate version introduced each theme and annotate version-range dependencies in theme reasoning.
+   - **Phase 3 — Selective Per-Note Enhancement**: Only high-risk notes or notes with direct commit matches receive deep per-note analysis.
+   - **Phase 4 — Shadow Change Detection**: Identify commits that modify public surfaces but have no corresponding release note.
 
    Request structured output (JSON object with top-level fields):
 
@@ -248,6 +260,33 @@ The LLM then performs **semantic association** between release notes and commits
          "description": "Commit ghi9012 added an OAuth callback interface not mentioned in release notes",
          "evidence_commits": ["ghi9012"]
        }
+     ],
+     "progressive_fixes": [
+       {
+         "fix_id": "PF-01",
+         "issue_description": "Feishu auth token refresh failure under specific conditions",
+         "stages": [
+           {"note_id": "R-015", "source_version": "v2026.4.10", "fix_description": "Added token refresh retry attempts", "completeness": "mitigation"},
+           {"note_id": "R-042", "source_version": "v2026.4.11", "fix_description": "Fixed race condition in refresh logic", "completeness": "partial"},
+           {"note_id": "R-089", "source_version": "v2026.4.12", "fix_description": "Refactored Feishu auth module to eliminate token refresh issues", "completeness": "complete"}
+         ],
+         "final_status": "fully_fixed",
+         "impact_assessment": "Upgrading from v2026.4.10 to v2026.4.12 fully resolves this issue; intermediate versions may still experience intermittent auth failures",
+         "affected_components": ["Feishu", "Auth"]
+       }
+     ],
+     "version_evolution": [
+       {
+         "evolution_id": "VE-01",
+         "description": "Feishu authentication interface underwent three consecutive adjustments",
+         "affected_versions": ["v2026.4.10", "v2026.4.11", "v2026.4.12"],
+         "individual_risk": "low",
+         "cumulative_risk": "high",
+         "risk_escalation_reason": "v2026.4.10 deprecated the old QR binding, v2026.4.11 changed the default auth flow, v2026.4.12 fully removed QR support. Individually each is a gradual adjustment, but jumping from v0 to v3 requires handling deprecation notice, behavior change, and API removal all at once, with no intermediate migration buffer",
+         "related_themes": ["T-01"],
+         "affected_components": ["Feishu", "Auth"],
+         "migration_advice": "Recommended stepwise upgrade: first upgrade to v2026.4.11 to complete manual configuration migration, verify it works, then upgrade to v2026.4.12. Do not skip intermediate versions."
+       }
      ]
    }
    ```
@@ -279,7 +318,7 @@ The LLM then performs **semantic association** between release notes and commits
 
    For each chunk file (e.g., `chunk-000.json`, `chunk-001.json`, ...):
    - Read the chunk file
-   - Feed it to the LLM with the same three-phase prompt
+   - Feed it to the LLM with the same four-phase prompt
    - Save the LLM output to the corresponding chunk result file:
      ```
      <snapshot-dir>/<repo>-<target>-llm-results-chunk-000.json
@@ -320,7 +359,7 @@ The LLM then performs **semantic association** between release notes and commits
 
 **Fallback**: If LLM analysis is unavailable, fails, or `--no-llm` is specified, the script automatically falls back to rule-based analysis. The report structure remains identical regardless of analysis mode.
 
-**Default mode shortcut**: If an `llm-results.json` file already exists in the snapshot directory from a previous run, the default command (`--target ... --compare ...`) automatically detects and applies it without requiring `--apply-llm-results`.
+**Default mode shortcut**: If an `llm-results.json` file already exists in the snapshot directory from a previous run, the default command (`--target ... --compare ...`) automatically detects and applies it without requiring `--apply-llm-results`. Before applying cached LLM results, the script verifies their consistency with the associated snapshot (valid JSON, not older than snapshot). If the consistency check fails, the cached results are discarded and fresh analysis data is prepared.
 
 **LLM-Driven Report Architecture**: In the new architecture, the script is a data pipeline and the LLM performs ALL semantic analysis. The script does not merge LLM results with rule-based templates. Instead, the LLM outputs complete report sections (executive summary, themes, detailed notes, compatibility risks, test points, shadow changes), and the script renders them directly. This eliminates template bias and maximizes analysis depth.
 
@@ -414,16 +453,42 @@ To minimize total execution time:
 - **If chunk results have conflicting themes** (same `theme_id` but different `theme_name`): The merge step uses the first encountered name; this is acceptable because `theme_id` is the stable key.
 - **If `--merge-chunk-results` fails**: Report the error with the specific exception and **stop** — do not attempt manual merging.
 
-**Post-merge review rule:**
+**Post-merge Enhancement Protocol:**
 
-After `--merge-chunk-results` succeeds, the merged `llm-results.json` contains auto-synthesized `executive_summary` and `developer_conclusion`. Because the merge step is pure Python (no LLM), these fields may be generic or incomplete. You MUST review and enhance them before generating the final report:
+After `--merge-chunk-results` completes, the script automatically evaluates the quality of the merged `llm-results.json` and may signal that enhancement is needed.
 
-1. Read the merged `llm-results.json`.
-2. Check `executive_summary.theme` — if it is vague (e.g., "多个主题变更"), replace it with a concise, specific theme (within 15 characters).
-3. Check `executive_summary.magnitude` — if underestimated (e.g., "中" for 200+ items), correct it to "大".
-4. Check `developer_conclusion` — if empty or generic, write a specific one-sentence verdict for plugin/channel developers based on the merged themes.
-5. Check `compatibility_risks` and `test_points` — if empty or sparse, populate them from the high-risk themes and detailed_notes.
-6. After patching, invoke `--apply-llm-results` again to regenerate the report with enhanced content.
+**Merge output signals:**
+- `CHUNK_MERGE_COMPLETE: 1` + `LLM_RESULTS: <path>` → merge succeeded, check for enhancement
+- `ENHANCEMENT_NEEDED: 1` + `ENHANCEMENT_PROMPT: <path>` + `NEEDS_FIELDS: <fields>` → merged results need LLM enhancement
+
+**When `ENHANCEMENT_NEEDED: 1` is signaled:**
+
+1. Read the enhancement prompt file (`*-enhancement-prompt.txt`). It contains:
+   - Summaries of all merged themes (name, risk, category, note count, summary)
+   - High-risk theme details and high-risk detailed note summaries
+   - A list of fields that need enhancement (e.g., `executive_summary.theme`, `developer_conclusion`, `compatibility_risks`, `test_points`)
+
+2. Feed the enhancement prompt to the LLM and request a JSON response with only the fields that need enhancement:
+   ```json
+   {
+     "executive_summary": { "recommendation": "...", "theme": "...", "magnitude": "...", "reason": "...", "top_changes": [...], "one_liner": "..." },
+     "developer_conclusion": "...",
+     "compatibility_risks": [{"component": "...", "description": "..."}],
+     "test_points": ["..."]
+   }
+   ```
+
+3. Read the merged `llm-results.json`, patch the fields that need enhancement with the LLM-generated content, and write it back.
+
+4. Invoke `--apply-llm-results` to regenerate the final report with the enhanced content.
+
+**When `ENHANCEMENT_NEEDED` is NOT signaled:**
+- The merged results are considered high-quality. Proceed directly to `--apply-llm-results`.
+
+**Why this approach:**
+- The pure-Python merge step is fast and reliable but cannot synthesize nuanced executive summaries.
+- The enhancement prompt contains only theme/note summaries (not raw data), so the LLM enhancement is a lightweight single-prompt operation (~5K tokens vs. the full analysis at 80K+ tokens).
+- The AI agent decides whether to perform the enhancement based on the script's signal, not by manually inspecting the merged file.
 
 **Analysis focus rule (to reduce per-chunk time without losing accuracy):**
 
@@ -602,7 +667,12 @@ These sections are part of the standard report layout:
 - **Included Releases** (only when `scoped releases > 1`): table listing all releases in the analyzed range with version, publish date, and status.
 - **Executive Summary** (总体结论 / 执行摘要): upgrade recommendation label, dominant theme, change magnitude (total items with risk breakdown), top 5 most critical changes with appendix links and risk icons, and a one-line judgment tailored to the release profile (prerelease warning, breaking-change caution, security priority, developer-surface updates, or low-risk routine).
 - **Developer Conclusion** (面向 Channel / 插件开发者的一句话结论): a one-sentence verdict for plugin/channel developers, with conditional branching based on breaking changes, security density, plugin/API count, or config changes.
-- **Deep Dive** (深度分析): themed component-cluster analysis. Groups items by component (e.g., CLI, Plugin system, API/SDK, Security), sorts clusters by priority, and for each cluster provides: thematic analysis paragraph, related item list with appendix links, risk level, primary audience, and suggested actions. Limited to the top 6 most impactful clusters.
+- **Thematic Overview** (变更主题概览): semantic clustering of all changes into 8-15 functional themes, sorted by risk. Each theme shows item count, risk level, related commits, and summary.
+- **Progressive Fix Detection** (渐进式修复检测): when analyzing a version range, shows fix chains where the same issue was addressed incrementally across releases (e.g., mitigation → partial fix → complete fix). Each chain displays stages with version, fix description, and completeness level, plus final status and impact assessment.
+- **Cumulative Breaking Change Analysis** (累积 Breaking Change 分析): when analyzing a version range, highlights cases where individual versions appear low-risk but the aggregate impact across the upgrade path is high. Shows per-version risk vs. cumulative risk, with a concrete explanation of why skipping intermediate versions is more dangerous.
+- **High-Risk Theme Details** (高风险主题详解): deep-dive analysis for high and medium risk themes. Each theme expanded with impact description, affected files, related commits, and navigation links to appendix detailed notes. Limited to top 8 risky themes.
+- **Code Change Evidence** (代码变更证据链): note-to-commit association table showing which commits correspond to which release notes, with changed files and reasoning.
+- **Shadow Changes** (未记录变更提示): commits that modify public surfaces but have no corresponding release note.
 - **Compatibility Risks** (兼容性与风险点): high and medium risk items relevant to plugin/channel developers, with contextual risk descriptions (breaking change, security tightening, dependency shifts, config changes).
 - **Suggested Test Points** (建议验证的测试点): actionable regression test recommendations derived from detected signals (auth, plugin, CLI, channel, dependency).
 - **Ignorable Changes** (可暂时忽略的变更): low-risk, low-relevance items that can be deferred in a second reading.

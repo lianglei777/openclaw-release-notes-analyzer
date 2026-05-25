@@ -18,24 +18,12 @@ from models import (
     LLMCompatibilityRisk,
     LLMFullReport,
     LLMNoteAnalysis,
+    ProgressiveFix,
     Release,
     Theme,
+    VersionEvolution,
 )
 
-# ---------------------------------------------------------------------------
-# Truncation configuration — centralised to avoid hard-coded magic numbers
-# ---------------------------------------------------------------------------
-TRUNCATE_CONFIG = {
-    "theme_summary_table": 120,
-    "theme_impact_preview": 200,
-    "code_evidence_raw_text": 100,
-    "code_evidence_reasoning": 300,
-    "detailed_note_reasoning": 500,
-    "detailed_note_raw_preview": 100,
-    "note_desc_preview": 120,
-    "per_note_code_evidence": 200,
-    "per_note_llm_reasoning": 250,
-}
 
 def stable_releases(releases: Sequence[Release]) -> List[Release]:
     return [release for release in releases if release.is_stable]
@@ -873,13 +861,10 @@ def render_themes_overview(
         commit_str = " ".join(f"`{c[:7]}`" for c in theme.related_commits[:3]) if theme.related_commits else "-"
         # Overview uses summary only; impact is shown in the deep-dive section
         summary = theme.summary or "-"
-        max_summary = TRUNCATE_CONFIG["theme_summary_table"]
-        if len(summary) > max_summary:
-            summary = summary[:max_summary - 3] + "..."
         note_count = len(theme.note_ids)
         lines.append(f"| **{theme.theme_name}** | {note_count} | {risk_icon} {theme.risk_level} | {commit_str} | {summary} |")
 
-    # Add high-risk theme quick summary (uses full impact, not truncated)
+    # Add high-risk theme quick summary
     high_risk_themes = [t for t in sorted_themes if t.risk_level == "high"]
     if high_risk_themes:
         lines.append("")
@@ -889,10 +874,142 @@ def render_themes_overview(
             lines.append("**High-risk themes requiring attention**:")
         for theme in high_risk_themes:
             impact = theme.impact or theme.summary or ""
-            max_impact = TRUNCATE_CONFIG["theme_impact_preview"]
-            if len(impact) > max_impact:
-                impact = impact[:max_impact - 3] + "..."
             lines.append(f"- **{theme.theme_name}**：{impact}")
+
+    return "\n".join(lines)
+
+
+def render_progressive_fixes(
+    fixes: Sequence[ProgressiveFix],
+    lang: str,
+) -> str:
+    """Render progressive fix chains detected across multiple versions.
+
+    Shows how the same issue was addressed incrementally across releases.
+    """
+    if not fixes:
+        return "- 未检测到渐进式修复链。" if lang == "zh" else "- No progressive fix chains detected."
+
+    lines: List[str] = []
+    if lang == "zh":
+        lines.append("## 渐进式修复检测")
+        lines.append("")
+        lines.append(f"检测到 **{len(fixes)}** 个跨版本的渐进式修复链：")
+        lines.append("")
+    else:
+        lines.append("## Progressive Fix Detection")
+        lines.append("")
+        lines.append(f"Detected **{len(fixes)}** progressive fix chain(s) across versions:")
+        lines.append("")
+
+    for idx, fix in enumerate(fixes, 1):
+        status_label = {
+            "fully_fixed": ("已完全修复", "Fully Fixed"),
+            "partially_fixed": ("仍部分修复", "Partially Fixed"),
+            "mitigated": ("仅缓解", "Mitigated"),
+        }.get(fix.final_status, (fix.final_status, fix.final_status))
+
+        if lang == "zh":
+            lines.append(f"### PF-{idx:02d}：{fix.issue_description or '未命名问题'}")
+            lines.append("")
+            lines.append(f"**最终状态**：{status_label[0]}")
+            if fix.affected_components:
+                lines.append(f"**受影响组件**：{', '.join(fix.affected_components)}")
+            lines.append("")
+            lines.append("| 阶段 | 版本 | 修复内容 | 完整度 |")
+            lines.append("|---|---|---|---|")
+        else:
+            lines.append(f"### PF-{idx:02d}: {fix.issue_description or 'Unnamed Issue'}")
+            lines.append("")
+            lines.append(f"**Final Status**: {status_label[1]}")
+            if fix.affected_components:
+                lines.append(f"**Affected Components**: {', '.join(fix.affected_components)}")
+            lines.append("")
+            lines.append("| Stage | Version | Fix Description | Completeness |")
+            lines.append("|---|---|---|---|")
+
+        completeness_label = {
+            "mitigation": ("缓解", "Mitigation"),
+            "partial": ("部分修复", "Partial"),
+            "complete": ("完整修复", "Complete"),
+        }
+
+        for stage_idx, stage in enumerate(fix.stages, 1):
+            ver = stage.get("source_version", "-")
+            desc = stage.get("fix_description", "-")
+            comp = stage.get("completeness", "")
+            comp_text = completeness_label.get(comp, (comp, comp))[0 if lang == "zh" else 1]
+            lines.append(f"| {stage_idx} | `{ver}` | {desc} | {comp_text} |")
+
+        if fix.impact_assessment:
+            if lang == "zh":
+                lines.append("")
+                lines.append(f"**影响评估**：{fix.impact_assessment}")
+            else:
+                lines.append("")
+                lines.append(f"**Impact Assessment**: {fix.impact_assessment}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_version_evolution(
+    evolutions: Sequence[VersionEvolution],
+    lang: str,
+) -> str:
+    """Render cumulative breaking change analysis across version ranges.
+
+    Highlights cases where individual versions appear low-risk but the
+    aggregate impact across the upgrade path is high.
+    """
+    if not evolutions:
+        return "- 未检测到累积 Breaking Change 风险。" if lang == "zh" else "- No cumulative breaking change risks detected."
+
+    lines: List[str] = []
+    if lang == "zh":
+        lines.append("## 累积 Breaking Change 分析")
+        lines.append("")
+        lines.append(f"检测到 **{len(evolutions)}** 个版本演进模式，单版本风险可能被低估：")
+        lines.append("")
+    else:
+        lines.append("## Cumulative Breaking Change Analysis")
+        lines.append("")
+        lines.append(f"Detected **{len(evolutions)}** version evolution pattern(s) where per-version risk may be underestimated:")
+        lines.append("")
+
+    for idx, evo in enumerate(evolutions, 1):
+        risk_icon_ind = "🔴" if evo.individual_risk == "high" else ("⚠️" if evo.individual_risk == "medium" else "🟢")
+        risk_icon_cum = "🔴" if evo.cumulative_risk == "high" else ("⚠️" if evo.cumulative_risk == "medium" else "🟢")
+
+        if lang == "zh":
+            lines.append(f"### VE-{idx:02d}：{evo.description or '未命名演进'}")
+            lines.append("")
+            vers = " → ".join(f"`{v}`" for v in evo.affected_versions)
+            lines.append(f"**涉及版本**：{vers}")
+            lines.append(f"**单版本风险**：{risk_icon_ind} {evo.individual_risk}　**累积风险**：{risk_icon_cum} {evo.cumulative_risk}")
+            if evo.affected_components:
+                lines.append(f"**受影响组件**：{', '.join(evo.affected_components)}")
+            lines.append("")
+            if evo.risk_escalation_reason:
+                lines.append(f"**风险升级原因**：{evo.risk_escalation_reason}")
+                lines.append("")
+            if evo.migration_advice:
+                lines.append(f"**迁移建议**：{evo.migration_advice}")
+        else:
+            lines.append(f"### VE-{idx:02d}: {evo.description or 'Unnamed Evolution'}")
+            lines.append("")
+            vers = " → ".join(f"`{v}`" for v in evo.affected_versions)
+            lines.append(f"**Versions**: {vers}")
+            lines.append(f"**Individual Risk**: {risk_icon_ind} {evo.individual_risk}　**Cumulative Risk**: {risk_icon_cum} {evo.cumulative_risk}")
+            if evo.affected_components:
+                lines.append(f"**Affected Components**: {', '.join(evo.affected_components)}")
+            lines.append("")
+            if evo.risk_escalation_reason:
+                lines.append(f"**Risk Escalation Reason**: {evo.risk_escalation_reason}")
+                lines.append("")
+            if evo.migration_advice:
+                lines.append(f"**Migration Advice**: {evo.migration_advice}")
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -930,10 +1047,7 @@ def render_themed_deep_dive(
         for nid in theme.note_ids[:8]:
             analysis = analysis_map.get(nid)
             if analysis:
-                max_preview = TRUNCATE_CONFIG["note_desc_preview"]
                 text = analysis.raw_text
-                if len(text) > max_preview:
-                    text = text[:max_preview - 3] + "..."
                 note_risk = "🔴" if analysis.risk_level == "high" else ("⚠️" if analysis.risk_level == "medium" else "🟢")
                 note_descs.append(f"- [`{nid}`](#appendix-{nid.lower()}) {note_risk} {text}")
 
@@ -959,11 +1073,7 @@ def render_themed_deep_dive(
         nav_links: List[str] = []
         for nid in theme.note_ids:
             if nid in detailed_map:
-                analysis = analysis_map.get(nid)
-                preview = ""
-                if analysis:
-                    preview = analysis.raw_text[:40] + "..." if len(analysis.raw_text) > 40 else analysis.raw_text
-                nav_links.append(f"- [`{nid}`](#appendix-{nid.lower()}) — {preview}")
+                nav_links.append(f"- [`{nid}`](#appendix-{nid.lower()})")
 
         nav_section = ""
         if nav_links[:5]:
@@ -1025,21 +1135,13 @@ def render_code_evidence(
             continue
 
         analysis = analysis_map.get(nid)
-        raw_text = ""
-        if analysis:
-            max_preview = TRUNCATE_CONFIG["code_evidence_raw_text"]
-            raw_text = analysis.raw_text
-            if len(raw_text) > max_preview:
-                raw_text = raw_text[:max_preview - 3] + "..."
+        raw_text = analysis.raw_text if analysis else ""
 
         commit_links = " ".join(f"`{c[:7]}`" for c in detail.matched_commits) if detail.matched_commits else "-"
         file_links = " ".join(f"`{f}`" for f in detail.affected_files[:3]) if detail.affected_files else "-"
         reasoning = detail.reasoning or ""
         if reasoning:
-            max_reason = TRUNCATE_CONFIG["code_evidence_reasoning"]
             reasoning = reasoning.replace("\n", "<br>")
-            if len(reasoning) > max_reason:
-                reasoning = reasoning[:max_reason - 3] + "..."
 
         rows.append((nid, raw_text, commit_links, file_links, reasoning))
 
@@ -1173,14 +1275,12 @@ def render_per_note_analysis(
         if item.code_evidence:
             evidence = item.code_evidence.replace("|", "\\|").replace("\n", "<br>")
             label_ce = strings.get("code_evidence_label", "Code Evidence" if lang == "en" else "代码证据")
-            max_ev = TRUNCATE_CONFIG["per_note_code_evidence"]
-            rows.append(f"| {label_ce} | `{evidence[:max_ev]}{'...' if len(item.code_evidence) > max_ev else ''}` |")
+            rows.append(f"| {label_ce} | `{evidence}` |")
         # Add LLM reasoning row if present
         if item.llm_reasoning:
             reasoning = item.llm_reasoning.replace("|", "\\|").replace("\n", "<br>")
             label_lr = "AI 推理过程" if lang == "zh" else "LLM Reasoning"
-            max_lr = TRUNCATE_CONFIG["per_note_llm_reasoning"]
-            rows.append(f"| {label_lr} | {reasoning[:max_lr]}{'...' if len(item.llm_reasoning) > max_lr else ''} |")
+            rows.append(f"| {label_lr} | {reasoning} |")
         rows.extend([
             f"| {raw_release_label} | {raw_text} |",
             f"| {strings['change_interpretation']} | {interpretation} |",
@@ -1316,13 +1416,18 @@ def _render_test_points_from_llm(
 def _render_detailed_notes_from_llm(
     notes: Sequence[LLMNoteAnalysis],
     lang: str,
+    analyses: Sequence[ChangeAnalysis],
 ) -> str:
     """Render detailed note analysis directly from LLM output."""
     if not notes:
         return "- 暂无 LLM 逐条分析数据。" if lang == "zh" else "- No LLM per-note analysis available."
 
+    # Build note_id -> ChangeAnalysis mapping for raw_text lookup
+    analysis_map = {a.note_id: a for a in analyses if a.note_id}
+
     field_header = "字段" if lang == "zh" else "Field"
     value_header = "内容" if lang == "zh" else "Value"
+    raw_label = "原始 Release Note" if lang == "zh" else "Raw Release Note"
     blocks: List[str] = []
 
     for item in notes[:40]:
@@ -1332,6 +1437,11 @@ def _render_detailed_notes_from_llm(
         actions = "<br>".join(f"• {a}" for a in item.action_items) if item.action_items else "-"
         commits = " ".join(f"`{c[:7]}`" for c in item.matched_commits) if item.matched_commits else "-"
         files = " ".join(f"`{f}`" for f in item.affected_files[:5]) if item.affected_files else "-"
+
+        # Look up raw release note text from ChangeAnalysis
+        raw_text = "-"
+        if nid in analysis_map:
+            raw_text = analysis_map[nid].raw_text.replace("|", "\\|").replace("\n", "<br>")
 
         rows = [
             f"| {field_header} | {value_header} |",
@@ -1348,9 +1458,9 @@ def _render_detailed_notes_from_llm(
             rows.append(f"| 受影响文件 | {files} |")
         if item.reasoning:
             reasoning = item.reasoning.replace("|", "\\|").replace("\n", "<br>")
-            max_reason = TRUNCATE_CONFIG["detailed_note_reasoning"]
-            rows.append(f"| AI 推理过程 | {reasoning[:max_reason]}{'...' if len(item.reasoning) > max_reason else ''} |")
+            rows.append(f"| AI 推理过程 | {reasoning} |")
         rows.extend([
+            f"| {raw_label} | {raw_text} |",
             f"| 变更解读 | {item.interpretation.replace(chr(124), chr(92)+chr(124)).replace(chr(10), '<br>') if item.interpretation else '-'} |",
             f"| 建议动作 | {actions} |",
         ])
@@ -1397,7 +1507,15 @@ def render_report(
         raise ValueError("categories is required; pass pre-computed categories from the caller")
 
     has_llm = llm_report is not None and (
-        llm_report.themes or llm_report.detailed_notes or llm_report.executive_summary.recommendation
+        llm_report.themes
+        or llm_report.detailed_notes
+        or llm_report.executive_summary.recommendation
+        or llm_report.progressive_fixes
+        or llm_report.version_evolution
+        or llm_report.shadow_changes
+        or llm_report.compatibility_risks
+        or llm_report.test_points
+        or llm_report.developer_conclusion
     )
 
     strings = _zh() if lang == "zh" else _en()
@@ -1450,6 +1568,8 @@ def render_report(
         developer_conclusion = re.sub(r'^#{1,3}\s*开发者结论\s*\n+', '', developer_conclusion, flags=re.IGNORECASE)
         developer_conclusion = re.sub(r'^#{1,3}\s*Developer Conclusion\s*\n+', '', developer_conclusion, flags=re.IGNORECASE)
         themes_overview = render_themes_overview(llm_report.themes, analyses_map, lang)
+        progressive_fixes_section = render_progressive_fixes(llm_report.progressive_fixes, lang)
+        version_evolution_section = render_version_evolution(llm_report.version_evolution, lang)
         deep_dive_section = render_themed_deep_dive(llm_report.themes, analyses, llm_report.detailed_notes, lang, strings)
         code_evidence_section = render_code_evidence(llm_report.detailed_notes, analyses, lang)
         shadow_section = render_shadow_changes(llm_report.shadow_changes, lang)
@@ -1463,6 +1583,8 @@ def render_report(
         )
         developer_conclusion = developer_facing_conclusion(analyses, lang, strings)
         themes_overview = "- 暂无主题聚类数据。" if lang == "zh" else "- No thematic clustering data available."
+        progressive_fixes_section = "- 未检测到渐进式修复链。" if lang == "zh" else "- No progressive fix chains detected."
+        version_evolution_section = "- 未检测到累积 Breaking Change 风险。" if lang == "zh" else "- No cumulative breaking change risks detected."
         deep_dive_section = "- 暂无深度分析数据。" if lang == "zh" else "- No deep-dive data available."
         code_evidence_section = "- 暂无代码关联证据。" if lang == "zh" else "- No code association evidence available."
         shadow_section = render_shadow_changes([], lang)
@@ -1471,7 +1593,7 @@ def render_report(
 
     # Appendix: show LLM detailed_notes when available, otherwise rule-based enhanced notes
     if has_llm and llm_report.detailed_notes:
-        appendix_section = _render_detailed_notes_from_llm(llm_report.detailed_notes, lang)
+        appendix_section = _render_detailed_notes_from_llm(llm_report.detailed_notes, lang, analyses)
     else:
         appendix_section = f"""
 ## {f('per_note_analysis')}
@@ -1515,6 +1637,14 @@ def render_report(
 ---
 
 {themes_overview}
+
+---
+
+{progressive_fixes_section}
+
+---
+
+{version_evolution_section}
 
 ---
 

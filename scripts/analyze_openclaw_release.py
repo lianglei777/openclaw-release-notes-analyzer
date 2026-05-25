@@ -1,0 +1,1610 @@
+#!/usr/bin/env python3
+"""Analyze OpenClaw GitHub releases and emit a bilingual Markdown upgrade report."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import concurrent.futures
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from config import (
+    API_ROOT,
+    CONVENTIONAL_COMMIT_RE,
+    DEFAULT_REPO,
+    FILE_IMPORTANCE_PATTERNS,
+    KEYWORDS,
+    MAX_DIFF_FILES,
+    MAX_PATCH_LINES_PER_FILE,
+    MAX_TOTAL_DIFF_CHARS,
+    SECTION_HINTS,
+    ZH_KEYWORDS,
+    default_cache_dir,
+    LLM_RESULTS_TTL_DAYS,
+    RELEASE_NOTES_MAX_VERSIONS,
+)
+from i18n import T, _en, _zh, detect_language
+from models import ChangeAnalysis, CommitInfo, Release, Theme, LLMFullReport, normalize_version, version_key
+from prompts import (
+    analysis_data_path,
+    base_analysis_path,
+    build_analysis_data,
+    confidence_for,
+    discover_chunk_results,
+    enhance_analyses_with_llm,
+    llm_results_path,
+    merge_chunk_results,
+    parse_llm_results,
+    read_base_analysis,
+    select_relevant_commits,
+    should_use_llm_enhancement,
+    split_analysis_data_into_chunks,
+    should_use_chunking,
+    chunk_result_path,
+    write_analysis_data,
+    write_base_analysis,
+)
+from renderer import (
+    first_sentences,
+    newer_prereleases,
+    parse_date,
+    recommendation,
+    render_report,
+    stable_releases,
+)
+
+
+# ---------------------------------------------------------------------------
+# GitHub API
+# ---------------------------------------------------------------------------
+
+def request_json(url: str, token: Optional[str] = None) -> Any:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "openclaw-release-analyzer-skill",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GitHub API request failed: HTTP {exc.code} {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"GitHub API request failed: {exc.reason}") from exc
+
+
+def get_github_token(args_token: Optional[str]) -> Optional[str]:
+    """Get GitHub token from CLI args or GITHUB_TOKEN environment variable."""
+    if args_token:
+        return args_token
+    return os.environ.get("GITHUB_TOKEN")
+
+
+def verify_github_token(token: Optional[str]) -> Tuple[bool, Optional[str]]:
+    """Verify GitHub token validity by calling /rate_limit endpoint.
+
+    Returns (is_valid, error_message_or_none).
+    """
+    if not token:
+        return False, "No GitHub token provided"
+    url = f"{API_ROOT}/rate_limit"
+    try:
+        request_json(url, token)
+        return True, None
+    except RuntimeError as exc:
+        return False, str(exc)
+
+
+def fetch_releases(repo: str, token: Optional[str]) -> List[Release]:
+    url = f"{API_ROOT}/repos/{repo}/releases?per_page=100"
+    payload = request_json(url, token)
+    if not isinstance(payload, list):
+        raise RuntimeError("Unexpected GitHub releases response")
+    releases = []
+    for item in payload:
+        releases.append(
+            Release(
+                tag_name=item.get("tag_name") or "",
+                name=item.get("name") or item.get("tag_name") or "",
+                body=item.get("body") or "",
+                html_url=item.get("html_url") or "",
+                published_at=item.get("published_at") or "",
+                prerelease=bool(item.get("prerelease")),
+                draft=bool(item.get("draft")),
+            )
+        )
+    return releases
+
+
+def find_release(releases: Sequence[Release], version: str) -> Optional[Release]:
+    wanted = normalize_version(version).lower()
+    for release in releases:
+        candidates = {normalize_version(release.tag_name).lower(), release.tag_name.lower(), release.name.lower()}
+        if wanted in candidates or f"v{wanted}" in candidates:
+            return release
+    return None
+
+def snapshot_path(snapshot_dir: Path, repo: str, target: Optional[str]) -> Path:
+    repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
+    target_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", target or "latest-stable").strip("-") or "latest-stable"
+    return snapshot_dir / f"{repo_part}-{target_part}-release-notes.md"
+
+
+def encode_release_payload(releases: Sequence[Release]) -> str:
+    payload = [
+        {
+            "tag_name": release.tag_name,
+            "name": release.name,
+            "body": release.body,
+            "html_url": release.html_url,
+            "published_at": release.published_at,
+            "prerelease": release.prerelease,
+            "draft": release.draft,
+        }
+        for release in releases
+    ]
+    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
+
+
+def decode_release_payload(encoded: str) -> List[Release]:
+    payload = json.loads(base64.b64decode(encoded.encode("ascii")).decode("utf-8"))
+    if not isinstance(payload, list):
+        raise RuntimeError("Invalid snapshot release payload")
+    releases: List[Release] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise RuntimeError("Invalid snapshot release item")
+        releases.append(
+            Release(
+                tag_name=item.get("tag_name") or "",
+                name=item.get("name") or item.get("tag_name") or "",
+                body=item.get("body") or "",
+                html_url=item.get("html_url") or "",
+                published_at=item.get("published_at") or "",
+                prerelease=bool(item.get("prerelease")),
+                draft=bool(item.get("draft")),
+            )
+        )
+    return releases
+
+
+def write_release_snapshot(
+    path: Path,
+    repo: str,
+    target: Release,
+    compare: Optional[Release],
+    scoped: Sequence[Release],
+    releases: Sequence[Release],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    scoped_tags = ", ".join(release.tag_name for release in scoped)
+    frontmatter = [
+        "---",
+        f"repo: {repo}",
+        f"target_version: {target.tag_name}",
+        f"compare_version: {compare.tag_name if compare else ''}",
+        f"source_url: {target.html_url}",
+        "data_source: GitHub Releases API",
+        f"fetched_at: {fetched_at}",
+        f"release_published_at: {target.published_at}",
+        f"release_name: {target.name}",
+        f"scoped_releases: {scoped_tags}",
+        f"release_payload_base64: {encode_release_payload(releases)}",
+        "---",
+        "",
+    ]
+    body_parts: List[str] = []
+    for release in scoped:
+        body_parts.extend([
+            f"# {release.tag_name}",
+            "",
+            f"Release URL: {release.html_url}",
+            f"Published at: {release.published_at}",
+            "",
+            release.body.strip() or "(No release notes provided.)",
+            "",
+        ])
+    path.write_text("\n".join(frontmatter + body_parts), encoding="utf-8")
+
+
+def read_release_snapshot(path: Path) -> List[Release]:
+    text = path.read_text(encoding="utf-8")
+    match = re.search(r"^release_payload_base64:\s*(\S+)\s*$", text, re.MULTILINE)
+    if not match:
+        raise RuntimeError(f"Snapshot is missing release payload: {path}")
+    return decode_release_payload(match.group(1))
+
+
+def refresh_snapshot_and_load(args: argparse.Namespace) -> Tuple[Release, Optional[Release], List[Release], List[Release], Path]:
+    fresh_releases = fetch_releases(args.repo, args.github_token)
+    if not fresh_releases:
+        raise RuntimeError("No releases returned by GitHub")
+    target, compare, scoped = select_scope(args, fresh_releases)
+    path = snapshot_path(Path(args.snapshot_dir), args.repo, target.tag_name)
+    write_release_snapshot(path, args.repo, target, compare, scoped, fresh_releases)
+    snapshot_releases = read_release_snapshot(path)
+    snapshot_target, snapshot_compare, snapshot_scoped = select_scope(args, snapshot_releases)
+    return snapshot_target, snapshot_compare, snapshot_scoped, snapshot_releases, path
+
+
+def select_scope(args: argparse.Namespace, releases: Sequence[Release]) -> Tuple[Release, Optional[Release], List[Release]]:
+    stable = stable_releases(releases)
+    if not stable:
+        raise RuntimeError("No stable releases found")
+
+    target = find_release(releases, args.target) if args.target else stable[0]
+    if not target:
+        # P1-1: List available recent versions when target is not found
+        available = [r.tag_name for r in releases[:20]]
+        available_str = ", ".join(f"`{t}`" for t in available) if available else "(none)"
+        raise RuntimeError(
+            f"Target release not found: {args.target}\n"
+            f"Available recent releases: {available_str}"
+        )
+
+    compare = find_release(releases, args.compare) if args.compare else None
+
+    # P0-2: When both --target and --compare are explicitly provided,
+    # analyze the range between them (not just the target alone)
+    if args.target and args.compare and compare:
+        scoped = releases_between(releases, compare, target)
+        return target, compare, scoped
+
+    if args.from_version or args.to_version:
+        start = find_release(releases, args.from_version) if args.from_version else stable[-1]
+        end = find_release(releases, args.to_version) if args.to_version else target
+        if not start or not end:
+            # P1-1: List available recent versions when range release is not found
+            missing = args.from_version if not start else args.to_version
+            available = [r.tag_name for r in releases[:20]]
+            available_str = ", ".join(f"`{t}`" for t in available) if available else "(none)"
+            raise RuntimeError(
+                f"Range release not found: {missing}\n"
+                f"Available recent releases: {available_str}"
+            )
+        scoped = releases_between(releases, start, end)
+        return end, start, scoped
+
+    if not compare:
+        stables = stable_releases(releases)
+        stable_tags = [r.tag_name for r in stables]
+        if target.tag_name in stable_tags:
+            idx = stable_tags.index(target.tag_name)
+            compare = stables[idx + 1] if idx + 1 < len(stables) else None
+        else:
+            compare = stables[0] if stables else None
+    return target, compare, [target]
+
+
+def releases_between(releases: Sequence[Release], start: Release, end: Release) -> List[Release]:
+    ordered = sorted([r for r in releases if r.is_stable], key=lambda r: version_key(r.tag_name))
+    start_key = version_key(start.tag_name)
+    end_key = version_key(end.tag_name)
+    low, high = sorted([start_key, end_key])
+    selected = [r for r in ordered if low <= version_key(r.tag_name) <= high]
+    return list(reversed(selected))
+
+
+def classify_text(text: str) -> Dict[str, int]:
+    """Score text against keyword lists with weighted matching.
+
+    Weight rules:
+    - Phrases (containing space or >=15 chars): weight 3
+    - Medium-length terms (6-14 chars): weight 2
+    - Short terms (<6 chars): weight 1
+    Chinese keywords:
+    - Long terms (>=3 chars): weight 2
+    - Short terms (1-2 chars): weight 1
+    """
+    lowered = text.lower()
+    result: Dict[str, int] = {}
+    for category, words in KEYWORDS.items():
+        score = 0
+        for w in words:
+            if " " in w or len(w) >= 15:
+                matches = len(re.findall(r"\b" + re.escape(w) + r"\b", lowered))
+                score += matches * 3
+            elif len(w) >= 6:
+                matches = len(re.findall(r"\b" + re.escape(w) + r"\b", lowered))
+                score += matches * 2
+            else:
+                matches = len(re.findall(r"\b" + re.escape(w) + r"\b", lowered))
+                score += matches * 1
+        if score:
+            result[category] = result.get(category, 0) + score
+    # P1-3: Also check Chinese keywords for Chinese release notes
+    for category, words in ZH_KEYWORDS.items():
+        score = 0
+        for w in words:
+            if len(w) >= 3:
+                matches = len(re.findall(w, lowered))
+                score += matches * 2
+            else:
+                matches = len(re.findall(w, lowered))
+                score += matches * 1
+        if score:
+            result[category] = result.get(category, 0) + score
+    return result
+
+
+def current_section(line: str) -> Optional[str]:
+    match = re.match(r"^#{1,6}\s+(.+)$", line.strip())
+    if not match:
+        return None
+    title = re.sub(r"[^a-z0-9\s/-]", " ", match.group(1).lower())
+    for category, hints in SECTION_HINTS.items():
+        if any(hint in title for hint in hints):
+            return category
+    return None
+
+
+def classify_release(release: Release) -> Dict[str, List[str]]:
+    categories = {key: [] for key in [
+        "feature", "fix", "breaking", "security", "performance",
+        "plugin", "api_sdk", "cli", "config", "dependency", "migration",
+        "docs", "known_issue", "other"
+    ]}
+    section: Optional[str] = None
+    lines = release.body.splitlines()
+
+    for line in lines:
+        # P1-3: Try to detect section from Markdown headings (including emoji headings)
+        inferred = current_section(line)
+        if inferred:
+            section = inferred
+            continue
+
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # P1-3: Check if this is a conventional commit line
+        commit_match = CONVENTIONAL_COMMIT_RE.match(stripped)
+        if commit_match:
+            prefix = commit_match.group(1).lower()
+            content = commit_match.group(4).strip()
+            is_breaking_prefix = commit_match.group(3) is not None
+            # Map conventional commit prefix to category
+            prefix_map = {
+                "feat": "feature",
+                "fix": "fix",
+                "perf": "performance",
+                "docs": "docs",
+                "refactor": "other",
+                "test": "other",
+                "build": "dependency",
+                "ci": "other",
+                "chore": "other",
+                "revert": "other",
+            }
+            cat = prefix_map.get(prefix, "other")
+            if content not in categories[cat]:
+                categories[cat].append(content)
+            # Conventional Commit '!' marker (feat!, fix!, etc.) signals breaking change
+            if is_breaking_prefix and content not in categories["breaking"]:
+                categories["breaking"].append(content)
+            # Also check keywords in content
+            scores = classify_text(content)
+            for key in ["breaking", "security", "plugin", "api_sdk", "cli", "config", "migration"]:
+                if scores.get(key) and content not in categories[key]:
+                    categories[key].append(content)
+            continue
+
+        # P1-3: Handle bullet points and numbered lists
+        if not re.match(r"^([-*+] |\d+[.)]\s+)", stripped):
+            # P1-3: Check for BREAKING CHANGE: paragraph
+            if "BREAKING CHANGE:" in stripped.upper() or "破坏性变更" in stripped:
+                if stripped not in categories["breaking"]:
+                    categories["breaking"].append(stripped)
+            continue
+
+        item = re.sub(r"^([-*+] |\d+[.)]\s+)", "", stripped).strip()
+        if not item:
+            continue
+        resolved_categories = item_categories(item, section)
+        assigned = False
+        if section and section in categories:
+            categories[section].append(item)
+            assigned = True
+        for key in resolved_categories:
+            if key in categories and item not in categories[key]:
+                categories[key].append(item)
+                assigned = True
+        if not assigned:
+            categories["other"].append(item)
+
+    if not any(categories.values()) and release.body.strip():
+        summary = first_sentences(release.body.strip(), 5)
+        if summary:
+            categories["other"].extend(summary)
+    return categories
+
+
+def release_note_items(release: Release) -> List[str]:
+    items: List[str] = []
+    lines = release.body.splitlines()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        commit_match = CONVENTIONAL_COMMIT_RE.match(stripped)
+        if commit_match:
+            item = commit_match.group(4).strip()
+        elif re.match(r"^([-*+] |\d+[.)]\s+)", stripped):
+            item = re.sub(r"^([-*+] |\d+[.)]\s+)", "", stripped).strip()
+        elif "BREAKING CHANGE:" in stripped.upper() or "破坏性变更" in stripped:
+            item = stripped
+        else:
+            continue
+        item = normalize_item_text(item)
+        if item and item not in items:
+            items.append(item)
+    if not items and release.body.strip():
+        items.extend(first_sentences(release.body.strip(), 5))
+    return items
+
+
+def normalize_item_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+by\s+@[-\w]+\.?$", ".", text, flags=re.IGNORECASE)
+    return text
+
+
+def primary_category(scores: Dict[str, int], section: Optional[str] = None) -> str:
+    order = [
+        "breaking", "security", "dependency", "migration", "plugin", "api_sdk",
+        "cli", "config", "performance", "fix", "feature", "docs", "known_issue",
+    ]
+    if section and section in order:
+        return section
+    for key in order:
+        if scores.get(key):
+            return key
+    return "other"
+
+
+def has_explicit_breaking_signal(item: str) -> bool:
+    lowered = item.lower()
+    strong_tokens = [
+        "breaking change", "breaking:", "incompatible", "removed support", "remove support",
+        "removed flag", "removed command", "renamed command", "renamed flag",
+        "migration required", "requires node", "minimum node", "no longer supports",
+        "schema changed", "schema migration", "require its registered binary",
+    ]
+    # Semantic pattern matching for common breaking change expressions
+    patterns = [
+        r"no longer\s+\w+",  # no longer accepts, no longer supports, etc.
+        r"requires\s+\w+\s+[\d\.\+]+",  # requires node 18+, requires python 3.10
+        r"dropped\s+(support|the|compatibility|for)",  # dropped support, dropped the feature
+        r"removed\s+(the\s+)?[\w-]+\s+(option|flag|command|method|api)",
+    ]
+    has_pattern = any(re.search(p, lowered) for p in patterns)
+    return any(token in lowered for token in strong_tokens) or has_pattern or "破坏性变更" in item or "不兼容" in item
+
+
+def has_explicit_migration_signal(item: str) -> bool:
+    lowered = item.lower()
+    tokens = [
+        "migration required", "migration guide", "upgrade guide", "before you upgrade",
+        "no longer", "instead of", "deprecated in favor", "removed support",
+    ]
+    return any(token in lowered for token in tokens) or "迁移指南" in item or "升级指南" in item
+
+
+def has_explicit_dependency_signal(item: str) -> bool:
+    lowered = item.lower()
+    negative_tokens = [
+        "benchmark", "coverage", "fixture", "harness", "canary", "qa-lab",
+        "presentation capability", "tool fixture", "self-health", "restart readiness",
+    ]
+    if any(token in lowered for token in negative_tokens):
+        return False
+    return any(token in lowered for token in [
+        "dependency", "dependencies", "peer dependency", "peerdependencies", "minimum node",
+        "requires node", "node.js", "package.json", "npm", "yarn", "pnpm", "lockfile",
+        "runtime requirement", "build arg", "image build", "apt package", "base image",
+    ]) or "依赖" in item or "版本要求" in item
+
+
+def has_explicit_security_signal(item: str) -> bool:
+    lowered = item.lower()
+    negative_tokens = ["token-efficiency", "token efficiency", "token count", "token accounting", "token budget"]
+    if any(token in lowered for token in negative_tokens):
+        return False
+    strong_tokens = [
+        "security", "vulnerability", "cve", "cwe", "cvss", "credential", "secret",
+        "oauth", "sso", "authentication", "authorization", "permission", "sandbox escape",
+        "xss", "csrf", "rce", "remote code execution", "injection", "affected version",
+        "thumbprint", "certificate", "tls", "fingerprint",
+    ]
+    return any(token in lowered for token in strong_tokens) or any(token in item for token in ["安全", "漏洞", "认证", "授权", "权限", "凭据", "证书"])
+
+
+def has_explicit_plugin_signal(item: str) -> bool:
+    lowered = item.lower()
+    negative_tokens = [
+        "qa-lab", "qa suite", "coverage", "fixture", "fixtures", "harness", "canary",
+        "benchmark", "runtime parity", "token-efficiency",
+    ]
+    if any(token in lowered for token in negative_tokens) and "defineToolPlugin" not in item:
+        return False
+    strong_tokens = [
+        "plugin", "plugins", "manifest", "hook", "hooks", "loader", "extension",
+        "extensions", "capability", "capabilities", "defineToolPlugin", "plugin-backed",
+    ]
+    return any(token in lowered for token in strong_tokens) or "插件" in item
+
+
+
+def has_explicit_api_sdk_signal(item: str) -> bool:
+    lowered = item.lower()
+    strong_tokens = [
+        "api", "sdk", "public api", "method", "signature", "parameter", "return",
+        "typescript", "export", "exports", "openclawapi",
+    ]
+    return any(token in lowered for token in strong_tokens)
+
+
+def has_explicit_cli_signal(item: str) -> bool:
+    lowered = item.lower()
+    strong_tokens = [
+        "cli", "command", "subcommand", "flag", "option", "argument",
+        "stdout", "stderr", "exit code", "powershell profile", "completion",
+        "doctor", "plugins build", "plugins validate", "plugins init", "qa suite",
+    ]
+    return any(token in lowered for token in strong_tokens) or "命令行" in item
+
+
+def has_explicit_config_signal(item: str) -> bool:
+    lowered = item.lower()
+    strong_tokens = [
+        "config", "configuration", "setting", "settings", "schema", "env var",
+        "environment variable", "default account", "named accounts", "binding", "caFile",
+        "openclaw_image_apt_packages", "openclaw_docker_apt_packages",
+    ]
+    return any(token in lowered for token in strong_tokens) or "配置" in item
+
+
+def is_internal_qa_item(item: str) -> bool:
+    lowered = item.lower()
+    internal_tokens = ["qa-lab", "test", "tests", "fixture", "fixtures", "harness", "smoke", "canary", "coverage"]
+    public_tokens = ["runtime", "public", "api", "sdk", "cli", "config", "security", "auth", "plugin"]
+    return any(token in lowered for token in internal_tokens) and not any(token in lowered for token in public_tokens)
+
+
+def item_categories(item: str, section: Optional[str] = None) -> List[str]:
+    scores = classify_text(item)
+    # Section context bonus: items under a ## Breaking Changes heading get
+    # a strong signal for that category, even if keyword match is weak.
+    if section and section != "other":
+        scores[section] = scores.get(section, 0) + 5
+    keys = [
+        "breaking", "security", "dependency", "migration", "plugin", "api_sdk",
+        "cli", "config", "performance", "fix", "feature", "docs", "known_issue",
+    ]
+    # Threshold filtering: require score >= 2 to avoid weak single-word matches
+    found = [key for key in keys if scores.get(key, 0) >= 2]
+    if "breaking" in found and not has_explicit_breaking_signal(item):
+        found.remove("breaking")
+    if "migration" in found and not has_explicit_migration_signal(item):
+        found.remove("migration")
+    if "dependency" in found and not has_explicit_dependency_signal(item):
+        found.remove("dependency")
+    if "security" in found and not has_explicit_security_signal(item):
+        found.remove("security")
+    if "plugin" in found and not has_explicit_plugin_signal(item):
+        found.remove("plugin")
+    if "api_sdk" in found and not has_explicit_api_sdk_signal(item):
+        found.remove("api_sdk")
+    if "cli" in found and not has_explicit_cli_signal(item):
+        found.remove("cli")
+    if "config" in found and not has_explicit_config_signal(item):
+        found.remove("config")
+    if is_internal_qa_item(item):
+        found = [cat for cat in found if cat not in {"plugin", "api_sdk", "cli", "config", "security", "breaking", "migration"}]
+        if "docs" not in found:
+            found.append("docs")
+    if "feature" in found and any(cat in found for cat in ["breaking", "migration", "dependency", "security"]):
+        found.remove("feature")
+    if "fix" in found and any(cat in found for cat in ["feature", "docs"]) and not any(token in item.lower() for token in ["fix", "fixed", "fixes", "bug", "issue", "resolve", "resolved", "patch"]):
+        found.remove("fix")
+    return found or ["other"]
+
+
+
+def infer_component(item: str) -> str:
+    match = re.match(r"^([A-Za-z0-9_./@+ -]{2,80}?):\s+", item)
+    if match:
+        return match.group(1).strip()
+    lowered = item.lower()
+    component_map = [
+        ("qa-lab", "QA-Lab"),
+        ("docker/podman", "Docker/Podman"),
+        ("docker", "Docker/Podman"),
+        ("podman", "Docker/Podman"),
+        ("gateway/performance", "Gateway/performance"),
+        ("gateway", "Gateway"),
+        ("plugin", "Plugin system"),
+        ("cli", "CLI"),
+        ("api", "API/SDK"),
+        ("sdk", "API/SDK"),
+        ("config", "Configuration"),
+        ("node", "Runtime/Dependency"),
+        ("sidecar", "Sidecar"),
+        ("telegram", "Telegram integration"),
+        ("discord", "Discord integration"),
+        ("media", "Media pipeline"),
+        ("mac app", "Mac app"),
+        ("android", "Android"),
+        ("proxy", "Proxy"),
+        ("skills", "Skills"),
+        ("security", "Security"),
+    ]
+    for token, component in component_map:
+        if token in lowered:
+            return component
+    return "General"
+
+
+
+def risk_level(categories: Sequence[str], item: str) -> str:
+    lowered = item.lower()
+    if any(cat in categories for cat in ["breaking", "migration", "dependency"]):
+        if any(token in lowered for token in ["minimum node", "requires node", "breaking", "removed", "incompatible"]):
+            return "high"
+        return "medium"
+    if "security" in categories:
+        return "high" if any(token in lowered for token in ["cve", "vulnerability", "credential", "secret", "rce"]) else "medium"
+    if any(cat in categories for cat in ["plugin", "api_sdk", "cli", "config"]):
+        if any(token in lowered for token in ["signature", "removed", "deprecated", "renamed", "no longer", "dropped"]):
+            return "medium"
+        if "breaking" in categories or "migration" in categories:
+            return "medium"
+        return "low"
+    if "performance" in categories:
+        return "medium" if any(token in lowered for token in ["crash", "deadlock", "data loss", "leak", "hang"]) else "low"
+    return "low"
+
+
+def priority_score(categories: Sequence[str], risk: str) -> int:
+    score = {"high": 100, "medium": 60, "low": 20}.get(risk, 10)
+    weights = {
+        "breaking": 40, "security": 35, "dependency": 30, "migration": 30,
+        "plugin": 25, "api_sdk": 25, "cli": 18, "config": 18,
+        "performance": 15, "fix": 8, "feature": 6, "known_issue": 12,
+        "docs": -10, "other": 0,
+    }
+    return score + sum(weights.get(cat, 0) for cat in categories)
+
+
+def audience_for(categories: Sequence[str], component: str, lang: str) -> List[str]:
+    zh = lang == "zh"
+    labels = {
+        "plugin": "插件开发者" if zh else "plugin developers",
+        "api_sdk": "API/SDK 使用者" if zh else "API/SDK users",
+        "cli": "CLI 使用者和自动化脚本维护者" if zh else "CLI users and automation maintainers",
+        "config": "配置维护者和自部署用户" if zh else "configuration owners and self-hosted users",
+        "dependency": "CI/CD、部署和运行时维护者" if zh else "CI/CD, deployment, and runtime owners",
+        "security": "安全敏感用户" if zh else "security-sensitive users",
+        "performance": "稳定性敏感用户" if zh else "stability-sensitive users",
+        "fix": "受相关问题影响的用户" if zh else "users affected by the fixed issue",
+        "feature": "需要相关新能力的用户" if zh else "users who need the new capability",
+    }
+    audience: List[str] = []
+    for cat in ["plugin", "api_sdk", "cli", "config", "dependency", "security", "performance", "fix", "feature"]:
+        if cat in categories and labels[cat] not in audience:
+            audience.append(labels[cat])
+    if not audience:
+        audience.append("普通 OpenClaw 用户" if zh else "general OpenClaw users")
+    if component not in ["General", "Security"]:
+        audience.append((f"使用 {component} 相关能力的团队" if zh else f"teams using {component}-related functionality"))
+    return audience[:3]
+
+
+def interpret_change(item: str, categories: Sequence[str], component: str, lang: str) -> str:
+    clean = item.rstrip(".")
+    lowered = clean.lower()
+    if lang == "zh":
+        if "security" in categories:
+            if any(token in lowered for token in ["cve", "vulnerability", "security fix", "auth", "authentication", "permission", "credential", "token"]):
+                return f"这项更新与 {component} 的安全面有关，优先判断你当前版本是否落在受影响范围，以及认证、授权或凭据链路是否会因此变化。若命中生产路径，建议提前验证修复后的访问控制和失败处理。"
+            return f"这项更新收紧或调整了 {component} 的安全相关行为。它不一定会直接改变功能结果，但可能影响认证流程、权限边界或默认安全策略，升级前最好核对现网配置是否仍然成立。"
+        if "breaking" in categories or "migration" in categories:
+            return f"这项更新对 {component} 发出了兼容性或迁移信号。更值得关注的是现有接口、配置、脚本和自动化流程会不会失配；如果依赖旧行为，应该先补齐迁移核对和回归验证，再安排正式升级。"
+        if "dependency" in categories:
+            return f"这项更新更像是在改动 {component} 的环境前提，而不是单纯新增功能。需要先确认 Node.js、包管理器、锁文件、构建镜像和 CI/CD 运行时是否满足新的依赖要求，否则升级可能卡在安装、构建或启动阶段。"
+        if "fix" in categories and any(token in lowered for token in ["stop rejecting", "allow", "validation", "validate", "rejecting"]):
+            return f"这项更新是在修正 {component} 的校验或兼容性问题，重点价值是减少误报、误拒绝或本不该失败的场景。若你的团队之前绕过过类似限制，升级后应回归验证原先失败的链路是否已经恢复正常。"
+        if "plugin" in categories:
+            return f"这项更新会影响 {component} 的插件扩展面。即使不是破坏性变更，也可能波及插件清单、hook、加载顺序或扩展契约；对自定义插件较多的团队，建议把兼容性回归放进升级前检查。"
+        if "api_sdk" in categories:
+            return f"这项更新直接作用在 {component} 的 API/SDK 表面，调用方式、导出内容、类型定义或封装层都可能受影响。若你们有二次封装或对外集成，升级前最好先核对关键调用路径。"
+        if "cli" in categories:
+            return f"这项更新主要影响 {component} 的命令行使用方式。需要留意命令参数、子命令、输出格式或退出码是否变化，因为这些细节最容易连带影响自动化脚本和运维流程。"
+        if "config" in categories:
+            return f"这项更新集中在 {component} 的配置层，通常会影响 schema、默认值、必填项或环境变量约定。真正的风险不在文案本身，而在于旧配置是否还能被接受、以及部署参数是否需要同步调整。"
+        if "performance" in categories:
+            return f"这项更新偏向 {component} 的性能或稳定性改善，通常属于正向收益。对高负载、长连接或关键路径敏感的场景，仍建议用现网相近流量做一次回归确认，避免收益伴随行为变化。"
+        if "fix" in categories:
+            return f"这项更新是在修复 {component} 的具体问题。是否值得优先升级，主要取决于你当前是否正被同类缺陷影响；如果问题已命中生产或核心流程，这类版本通常有较高升级价值。"
+        if "feature" in categories:
+            return f"这项更新为 {component} 增加了新能力或增强了现有能力，更偏向可选收益而不是刚性升级项。如果你正好需要这部分能力，可以评估尽快跟进；否则可放到常规升级窗口处理。"
+        if "docs" in categories:
+            return f"这项更新主要是补充或修正文档，对运行时风险通常较小。但如果它解释的是新配置、迁移步骤或使用约束，仍值得核对你们当前实践是否与官方说明一致。"
+        if "known_issue" in categories:
+            return f"这条说明更像是在提示 {component} 仍有已知限制或待解决问题。它未必阻止升级，但会影响你对版本稳定性的预期，适合提前确认是否命中自身场景并准备规避方案。"
+        return f"这项更新来自 {component}，但 release note 提供的信息有限。仅凭这条描述还不足以判断升级价值，最好结合关联 PR、Issue 或实际改动范围再决定是否优先跟进。"
+    if "breaking" in categories or "migration" in categories:
+        return f"This change carries compatibility or migration signals for {component}. Verify existing usage, configuration, and automation before upgrading. Key note: {clean}."
+    if "dependency" in categories:
+        return f"This affects dependency or runtime requirements for {component}. Check installation, CI/CD, images, or production runtime compatibility. Key note: {clean}."
+    if "security" in categories:
+        return f"This is related to security, authentication, permissions, credentials, or sandbox boundaries. Confirm whether your deployment is affected. Key note: {clean}."
+    if any(cat in categories for cat in ["plugin", "api_sdk", "cli", "config"]):
+        return f"This affects developer-visible surface area for {component}, such as plugins, API/SDK, CLI, or configuration. Validate compatibility and docs. Key note: {clean}."
+    if "performance" in categories:
+        return f"This points to a performance or stability improvement in {component}. Validate in critical or high-load workflows. Key note: {clean}."
+    if "fix" in categories:
+        return f"This fixes a {component}-related issue. Prioritize it if you are affected by the same workflow. Key note: {clean}."
+    if "feature" in categories:
+        return f"This adds or improves {component}-related capability. Upgrade priority depends on whether you need it. Key note: {clean}."
+    return f"This is a general {component} update. The release note lacks enough context for deeper impact assessment; inspect the linked PR/issue if needed. Key note: {clean}."
+
+
+def actions_for(categories: Sequence[str], risk: str, component: str, lang: str) -> List[str]:
+    zh = lang == "zh"
+    actions: List[str] = []
+    if any(cat in categories for cat in ["breaking", "migration"]):
+        actions.append("先核对迁移说明、废弃项和重命名项，再安排升级验证。" if zh else "Check migration notes, deprecations, and renamed/removed items before validation.")
+        actions.append("对依赖旧接口、旧配置或旧脚本的流程做定向回归。" if zh else "Run targeted regression for flows that rely on old interfaces, config, or scripts.")
+    if "dependency" in categories:
+        actions.append("检查 Node.js、包管理器、锁文件、构建镜像和 CI/CD 运行时版本。" if zh else "Check Node.js, package manager, lockfile, build image, and CI/CD runtime versions.")
+    if "plugin" in categories:
+        actions.append("验证插件 manifest、hook 签名、加载顺序和扩展契约。" if zh else "Validate plugin manifests, hook signatures, loading order, and extension contracts.")
+    if "api_sdk" in categories:
+        actions.append("检查 API/SDK 导出、类型定义、封装层和弃用提示。" if zh else "Review API/SDK exports, types, wrappers, and deprecation notices.")
+    if "cli" in categories:
+        actions.append("回归测试依赖 CLI 参数、子命令、输出格式或退出码的脚本。" if zh else "Regression-test scripts that depend on CLI flags, subcommands, output, or exit codes.")
+    if "config" in categories:
+        actions.append("逐项比对配置 schema、默认值、必填项和环境变量约定。" if zh else "Review config schema, defaults, required fields, and env var expectations.")
+    if "security" in categories:
+        actions.append("确认受影响版本范围，并优先在预生产环境验证修复路径。" if zh else "Assess affected versions and prioritize validation in pre-production.")
+    if "performance" in categories:
+        actions.append("在关键路径运行回归、压力、启动或长稳测试。" if zh else "Run regression, stress, startup, or soak tests on critical paths.")
+    if "fix" in categories and not any(cat in categories for cat in ["breaking", "migration", "security", "performance"]):
+        actions.append("如果你正受同类问题影响，优先复现旧问题并确认修复是否生效。" if zh else "If you are affected, reproduce the old issue and confirm the fix.")
+    if not actions:
+        actions.append((f"如果依赖 {component} 相关能力，先在非生产环境完成验证再升级。" if zh else f"If you rely on {component}-related functionality, validate it outside production before upgrading."))
+    if risk == "high":
+        rollback_text = "准备回滚方案，并明确升级失败后的恢复路径。" if zh else "Prepare a rollback plan and define the recovery path before rollout."
+        if rollback_text not in actions:
+            actions.append(rollback_text)
+    deduped: List[str] = []
+    for action in actions:
+        if action not in deduped:
+            deduped.append(action)
+    return deduped[:3]
+
+
+
+def confidence_for(categories: Sequence[str], item: str, llm_enhanced: bool = False) -> str:
+    if llm_enhanced:
+        return "high"
+    has_component_prefix = bool(re.match(r"^[A-Za-z0-9_./@+ -]{2,80}:\s+", item))
+    if has_component_prefix and categories != ["other"]:
+        return "high"
+    if categories != ["other"]:
+        return "medium"
+    return "low"
+
+
+def analyze_change_item(item: str, release: Release, lang: str) -> ChangeAnalysis:
+    categories = item_categories(item)
+    component = infer_component(item)
+    risk = risk_level(categories, item)
+    return ChangeAnalysis(
+        release_tag=release.tag_name,
+        raw_text=item,
+        primary_category=categories[0],
+        categories=categories,
+        component=component,
+        interpretation=interpret_change(item, categories, component, lang),
+        risk_level=risk,
+        audience=audience_for(categories, component, lang),
+        action_items=actions_for(categories, risk, component, lang),
+        confidence=confidence_for(categories, item),
+        priority=priority_score(categories, risk),
+    )
+
+
+def analyze_release_notes(scoped: Sequence[Release], lang: str) -> List[ChangeAnalysis]:
+    analyses: List[ChangeAnalysis] = []
+    seen: set[str] = set()
+    for release in scoped:
+        for item in release_note_items(release):
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            analyses.append(analyze_change_item(item, release, lang))
+    return sorted(analyses, key=lambda entry: entry.priority, reverse=True)
+
+def score_file_importance(filename: str) -> int:
+    """Return an importance score for a changed file based on its path."""
+    score = 0
+    for pattern, weight in FILE_IMPORTANCE_PATTERNS:
+        if re.search(pattern, filename, re.IGNORECASE):
+            score += weight
+    # Files at repo root (package.json, tsconfig.json, etc.) get a small boost
+    if "/" not in filename and "." in filename:
+        score += 2
+    return score
+
+
+def truncate_patch(patch: str, max_lines: int = MAX_PATCH_LINES_PER_FILE) -> str:
+    """Truncate a unified-diff patch to at most max_lines, keeping header context."""
+    lines = patch.splitlines()
+    if len(lines) <= max_lines:
+        return patch
+    # Keep first few lines (file header + some context), add ellipsis, keep last few.
+    head = max_lines // 2
+    tail = max_lines - head - 1
+    return "\n".join(lines[:head] + ["... (patch truncated) ..."] + lines[-tail:])
+
+
+def fetch_compare_diff(repo: str, base: str, head: str, token: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Fetch compare data from GitHub API and return a list of file-change dicts.
+
+    Each dict contains:
+        - filename: str
+        - status: str (added, removed, modified, renamed)
+        - additions: int
+        - deletions: int
+        - patch: str (may be absent for binary files or large diffs)
+        - previous_filename: str (for renames)
+    """
+    url = f"{API_ROOT}/repos/{repo}/compare/{base}...{head}"
+    payload = request_json(url, token)
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected GitHub compare response")
+    files = payload.get("files", [])
+    result: List[Dict[str, Any]] = []
+    for f in files:
+        result.append({
+            "filename": f.get("filename", ""),
+            "status": f.get("status", ""),
+            "additions": f.get("additions", 0),
+            "deletions": f.get("deletions", 0),
+            "patch": f.get("patch", ""),
+            "previous_filename": f.get("previous_filename", ""),
+        })
+    return result
+
+
+def fetch_compare_commits(repo: str, base: str, head: str, token: Optional[str] = None) -> List[CommitInfo]:
+    """Fetch commits from GitHub Compare API and return structured commit info.
+
+    Uses the same /compare endpoint as fetch_compare_diff but extracts the
+    commit list instead of the file list. This avoids an extra API call.
+    """
+    url = f"{API_ROOT}/repos/{repo}/compare/{base}...{head}"
+    payload = request_json(url, token)
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected GitHub compare response")
+
+    commits: List[CommitInfo] = []
+    for c in payload.get("commits", []):
+        commit_data = c.get("commit", {})
+        # First line of commit message only (subject)
+        message = (commit_data.get("message", "") or "").split("\n")[0].strip()
+        author = (commit_data.get("author", {}) or {}).get("name", "")
+        sha = (c.get("sha", "") or "")[:8]
+
+        # Files changed in this specific commit (from the compare API nested data)
+        changed_files: List[str] = []
+        for f in c.get("files", []):
+            fname = f.get("filename", "")
+            if fname and fname not in changed_files:
+                changed_files.append(fname)
+
+        commits.append(
+            CommitInfo(
+                sha=sha,
+                message=message,
+                author_name=author,
+                changed_files=changed_files,
+            )
+        )
+
+    return commits
+
+
+def select_important_files(
+    files: List[Dict[str, Any]],
+    max_files: int = MAX_DIFF_FILES,
+    max_chars: int = MAX_TOTAL_DIFF_CHARS,
+    max_lines_per_file: int = MAX_PATCH_LINES_PER_FILE,
+) -> List[Dict[str, Any]]:
+    """Sort files by importance, truncate patches, and stay within character budget."""
+    # Score and sort descending
+    scored = [(f, score_file_importance(f["filename"])) for f in files]
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    selected: List[Dict[str, Any]] = []
+    total_chars = 0
+    for f, score in scored:
+        if len(selected) >= max_files:
+            break
+        # Skip files with negative score unless we haven't selected anything yet
+        if score < 0 and len(selected) >= 5:
+            continue
+        patch = f.get("patch", "")
+        if patch:
+            patch = truncate_patch(patch, max_lines_per_file)
+        entry = {
+            "filename": f["filename"],
+            "status": f["status"],
+            "additions": f["additions"],
+            "deletions": f["deletions"],
+            "patch": patch,
+            "previous_filename": f.get("previous_filename", ""),
+            "importance_score": score,
+        }
+        entry_chars = len(json.dumps(entry, ensure_ascii=False))
+        if total_chars + entry_chars > max_chars and len(selected) >= 3:
+            # Budget exhausted but keep at least 3 files
+            break
+        selected.append(entry)
+        total_chars += entry_chars
+    return selected
+
+
+def format_diff_summary(files: List[Dict[str, Any]], lang: str = "zh") -> str:
+    """Format selected file changes into a concise text summary for LLM prompt."""
+    lines: List[str] = []
+    header = "代码变更摘要（按重要性排序）" if lang == "zh" else "Code Change Summary (sorted by importance)"
+    lines.append(f"## {header}")
+    lines.append("")
+    total_add = sum(f.get("additions", 0) for f in files)
+    total_del = sum(f.get("deletions", 0) for f in files)
+    stats = f"共 {len(files)} 个文件，+{total_add}/-{total_del}" if lang == "zh" else f"{len(files)} files, +{total_add}/-{total_del}"
+    lines.append(f"*{stats}*")
+    lines.append("")
+    for f in files:
+        fname = f["filename"]
+        status = f["status"]
+        prev = f.get("previous_filename", "")
+        status_zh = {"added": "新增", "removed": "删除", "modified": "修改", "renamed": "重命名"}.get(status, status)
+        status_en = status
+        score = f.get("importance_score", 0)
+        if lang == "zh":
+            lines.append(f"### {fname} ({status_zh}, +{f['additions']}/-{f['deletions']}, 重要性:{score})")
+        else:
+            lines.append(f"### {fname} ({status_en}, +{f['additions']}/-{f['deletions']}, importance:{score})")
+        if prev:
+            lines.append(f"*Previous name: {prev}*" if lang == "en" else f"*原文件名: {prev}*")
+        patch = f.get("patch", "")
+        if patch:
+            lines.append("```diff")
+            lines.append(patch)
+            lines.append("```")
+        else:
+            lines.append("*(binary or patch unavailable)*" if lang == "en" else "*(二进制文件或 patch 不可用)*")
+        lines.append("")
+    return "\n".join(lines)
+
+def _skill_dir() -> Path:
+    """Return the skill installation directory."""
+    return Path(__file__).resolve().parent.parent
+
+
+def _is_inside_skill_dir(path: Path) -> bool:
+    """Check if a path is inside the skill installation directory."""
+    try:
+        path.resolve().relative_to(_skill_dir().resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _cleanup_transient_files(snapshot_dir: Path, repo: str, target_tag: str) -> None:
+    """Remove step-internal transient files after report generation."""
+    repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
+    target_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", target_tag).strip("-") or "target"
+
+    # Clean up base analysis cache
+    base_path = snapshot_dir / f"{repo_part}-{target_part}-base-analysis.json"
+    if base_path.exists():
+        try:
+            base_path.unlink()
+        except OSError:
+            pass
+
+    # Clean up analysis data file (new single-file mode)
+    data_path = snapshot_dir / f"{repo_part}-{target_part}-analysis-data.json"
+    if data_path.exists():
+        try:
+            data_path.unlink()
+        except OSError:
+            pass
+
+    # Clean up chunk data files
+    chunk_pattern = f"{repo_part}-{target_part}-analysis-chunk-*.json"
+    for chunk_file in snapshot_dir.glob(chunk_pattern):
+        try:
+            chunk_file.unlink()
+        except OSError:
+            pass
+
+    # Clean up legacy per-component prompt files (backward compatibility)
+    pattern = f"{repo_part}-{target_part}-*-llm-prompt.json"
+    for prompt_file in snapshot_dir.glob(pattern):
+        try:
+            prompt_file.unlink()
+        except OSError:
+            pass
+
+
+def _cleanup_expired_cache(snapshot_dir: Path) -> None:
+    """Remove expired cache files on startup (lazy cleanup).
+
+    Retention policy:
+    - release-notes.md: keep up to RELEASE_NOTES_MAX_VERSIONS most recent
+    - llm-results.json: keep for LLM_RESULTS_TTL_DAYS
+    - llm-prompt.json / base-analysis.json: transient, remove on every run
+    """
+    if not snapshot_dir.exists():
+        return
+
+    now = time.time()
+    llm_results_ttl = LLM_RESULTS_TTL_DAYS * 86400
+
+    # Clean up stale LLM result files
+    for results_file in snapshot_dir.glob("*-llm-results.json"):
+        try:
+            if now - results_file.stat().st_mtime > llm_results_ttl:
+                results_file.unlink()
+        except OSError:
+            pass
+
+    # Clean up leftover analysis-data files from previous runs
+    for data_file in snapshot_dir.glob("*-analysis-data.json"):
+        try:
+            data_file.unlink()
+        except OSError:
+            pass
+
+    # Clean up legacy per-component prompt files
+    for prompt_file in snapshot_dir.glob("*-llm-prompt.json"):
+        try:
+            prompt_file.unlink()
+        except OSError:
+            pass
+
+    # Clean up leftover base-analysis files
+    for base_file in snapshot_dir.glob("*-base-analysis.json"):
+        try:
+            base_file.unlink()
+        except OSError:
+            pass
+
+    # Clean up chunk data files from previous runs
+    for chunk_file in snapshot_dir.glob("*-analysis-chunk-*.json"):
+        try:
+            chunk_file.unlink()
+        except OSError:
+            pass
+
+    # Keep only the most recent release notes snapshots
+    snapshots = sorted(
+        snapshot_dir.glob("*-release-notes.md"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for old_snapshot in snapshots[RELEASE_NOTES_MAX_VERSIONS:]:
+        try:
+            old_snapshot.unlink()
+        except OSError:
+            pass
+
+
+def _cleanup_all_cache(snapshot_dir: Path) -> int:
+    """Remove all cache files (used by --clean-cache)."""
+    if not snapshot_dir.exists():
+        print(f"Cache directory does not exist: {snapshot_dir}")
+        return 0
+
+    count = 0
+    for pattern in (
+        "*-release-notes.md",
+        "*-analysis-data.json",
+        "*-analysis-chunk-*.json",
+        "*-analysis-result-chunk-*.json",
+        "*-llm-results-chunk-*.json",
+        "*-llm-prompt.json",
+        "*-llm-results.json",
+        "*-base-analysis.json",
+    ):
+        for f in snapshot_dir.glob(pattern):
+            try:
+                f.unlink()
+                count += 1
+            except OSError:
+                pass
+    print(f"Cleaned {count} cached file(s) from {snapshot_dir}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Merge categories (existing)
+# ---------------------------------------------------------------------------
+
+def merge_categories(classified: Iterable[Dict[str, List[str]]]) -> Dict[str, List[str]]:
+    merged = {key: [] for key in [
+        "feature", "fix", "breaking", "security", "performance",
+        "plugin", "api_sdk", "cli", "config", "dependency", "migration",
+        "docs", "known_issue", "other"
+    ]}
+    for entry in classified:
+        for key, values in entry.items():
+            for value in values:
+                if value not in merged[key]:
+                    merged[key].append(value)
+    return merged
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Analyze OpenClaw GitHub releases")
+    parser.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repo in owner/name format")
+    parser.add_argument("--latest", action="store_true", help="Analyze latest stable release")
+    parser.add_argument("--target", help="Target release tag/version")
+    parser.add_argument("--compare", help="Compare baseline release tag/version")
+    parser.add_argument("--from", dest="from_version", help="Start version for range analysis")
+    parser.add_argument("--to", dest="to_version", help="End version for range analysis")
+    parser.add_argument("--include-beta", action="store_true", help="Include prerelease preview section")
+    parser.add_argument(
+        "--lang",
+        choices=["en", "zh", "auto"],
+        default="auto",
+        help="Report language: en=English, zh=Chinese, auto=detect from user input (default: auto)",
+    )
+    parser.add_argument(
+        "--user-query",
+        help="P0-3: User's original query text, used for language auto-detection when --lang auto is used.",
+    )
+    parser.add_argument(
+        "--github-token",
+        help="GitHub token for authenticated API access. Falls back to GITHUB_TOKEN environment variable. "
+             "Required for LLM-enhanced diff analysis; without it, only rule-based analysis is performed.",
+    )
+    parser.add_argument(
+        "--snapshot-dir",
+        default=None,
+        help="Directory for the freshly fetched release-notes snapshot used by this run. Defaults to the platform cache directory (e.g. ~/.cache/openclaw-release-analyzer/snapshots).",
+    )
+    parser.add_argument("--output", help="Write Markdown report to file")
+    parser.add_argument(
+        "--format",
+        choices=["markdown", "json"],
+        default="markdown",
+        help="Output format: markdown=full report (default). JSON mode is accepted for CLI compatibility but produces the same Markdown report.",
+    )
+    # LLM analysis modes (Claude Code orchestrates the LLM call)
+    parser.add_argument(
+        "--prepare-analysis-data",
+        action="store_true",
+        help="Generate a single analysis-data.json (release notes + commits + diff summary) and exit. "
+             "Claude Code reads this file, performs comprehensive LLM analysis, and writes results back.",
+    )
+    # Legacy alias for backward compatibility
+    parser.add_argument(
+        "--generate-llm-prompt",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--apply-llm-results",
+        help="Path to LLM analysis results JSON file. Merge these into the report generation.",
+    )
+    parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Disable LLM enhancement. Use only rule-based analysis.",
+    )
+    parser.add_argument(
+        "--prepare-chunks",
+        action="store_true",
+        help="Auto-split analysis data into chunks if it exceeds token threshold. "
+             "Outputs chunk file paths for distributed LLM processing.",
+    )
+    parser.add_argument(
+        "--merge-chunk-results",
+        action="store_true",
+        help="Discover and merge all chunk result files into a single llm-results.json. "
+             "Use after all chunks have been processed by LLM.",
+    )
+    parser.add_argument(
+        "--clean-cache",
+        action="store_true",
+        help="Remove all cached snapshot and intermediate files, then exit.",
+    )
+
+    return parser
+
+
+
+def _resolve_lang(args: argparse.Namespace) -> str:
+    """Resolve report language from CLI args."""
+    lang = args.lang
+    if lang == "auto":
+        sample = args.user_query or " ".join(
+            filter(None, [args.target or "", args.compare or "", args.from_version or "",
+                           args.to_version or "", args.repo or ""])
+        )
+        lang = detect_language(sample)
+    return lang
+
+
+def _build_categories_from_analyses(analyses: List[ChangeAnalysis]) -> Dict[str, List[str]]:
+    """Rebuild category mapping from a list of ChangeAnalysis objects."""
+    keys = [
+        "feature", "fix", "breaking", "security", "performance",
+        "plugin", "api_sdk", "cli", "config", "dependency", "migration",
+        "docs", "known_issue", "other",
+    ]
+    categories: Dict[str, List[str]] = {k: [] for k in keys}
+    for item in analyses:
+        for key in keys:
+            if key in item.categories and item.raw_text not in categories[key]:
+                categories[key].append(item.raw_text)
+    return categories
+
+
+def _load_snapshot_or_fetch(args: argparse.Namespace) -> Tuple[Release, Optional[Release], List[Release], List[Release], Path]:
+    """Load existing snapshot if available, otherwise fetch from GitHub API."""
+    snapshot_dir = Path(args.snapshot_dir) if args.snapshot_dir else Path(default_cache_dir())
+    # Try to find an existing snapshot for this target
+    target_hint = args.target or "latest-stable"
+    snapshot_path = snapshot_path_func(snapshot_dir, args.repo, target_hint)
+    if snapshot_path.exists():
+        try:
+            snapshot_releases = read_release_snapshot(snapshot_path)
+            target, compare, scoped = select_scope(args, snapshot_releases)
+            return target, compare, scoped, snapshot_releases, snapshot_path
+        except Exception:
+            pass  # fallback to fresh fetch
+    return refresh_snapshot_and_load(args)
+
+
+# Alias for snapshot path calculation used by _load_snapshot_or_fetch
+def snapshot_path_func(snapshot_dir: Path, repo: str, target: str) -> Path:
+    """Calculate the snapshot path without side effects."""
+    repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
+    target_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", target).strip("-") or "latest-stable"
+    return snapshot_dir / f"{repo_part}-{target_part}-release-notes.md"
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        # Resolve default snapshot directory
+        if args.snapshot_dir is None:
+            args.snapshot_dir = default_cache_dir()
+        snapshot_dir = Path(args.snapshot_dir)
+
+        # Guard: never write intermediate files into the skill directory
+        if _is_inside_skill_dir(snapshot_dir):
+            fallback = Path(default_cache_dir())
+            print(
+                f"Warning: snapshot-dir points inside skill installation ({snapshot_dir}). "
+                f"Falling back to {fallback}",
+                file=sys.stderr,
+            )
+            snapshot_dir = fallback
+            args.snapshot_dir = str(fallback)
+
+        # --clean-cache: remove all cached files and exit
+        if args.clean_cache:
+            return _cleanup_all_cache(snapshot_dir)
+
+        # Lazy cleanup of expired cache files on every run
+        _cleanup_expired_cache(snapshot_dir)
+
+        # -------------------------------------------------------------------
+        # Token verification (before any mode logic)
+        # -------------------------------------------------------------------
+        resolved_token = get_github_token(args.github_token)
+        token_valid, token_error = verify_github_token(resolved_token)
+        lang = _resolve_lang(args)
+        strings = _zh() if lang == "zh" else _en()
+
+        if token_valid:
+            args.github_token = resolved_token
+            print("TOKEN_STATUS: valid", file=sys.stderr)
+            print(f"Info: {strings['token_valid_info']}", file=sys.stderr)
+        else:
+            print("TOKEN_STATUS: invalid", file=sys.stderr)
+            if resolved_token:
+                print(f"{strings['token_invalid_warning']} ({token_error})", file=sys.stderr)
+            else:
+                print(f"{strings['token_missing_warning']}", file=sys.stderr)
+            if not args.no_llm:
+                print("Info: No valid token available; forcing rule-based analysis only.", file=sys.stderr)
+                args.no_llm = True
+
+        # -------------------------------------------------------------------
+        # Internal helper: prepare analysis data (shared by Mode A and Mode C)
+        # -------------------------------------------------------------------
+        def _run_prepare_analysis_data_mode() -> int:
+            target, compare, scoped, releases, snapshot = refresh_snapshot_and_load(args)
+            _lang = _resolve_lang(args)
+
+            _cleanup_transient_files(snapshot_dir, args.repo, target.tag_name)
+
+            import concurrent.futures
+
+            def _do_rule_analysis() -> List[ChangeAnalysis]:
+                return analyze_release_notes(scoped, _lang)
+
+            def _do_diff_fetch() -> List[Dict[str, Any]]:
+                if not compare:
+                    return []
+                try:
+                    all_files = fetch_compare_diff(
+                        args.repo, compare.tag_name, target.tag_name, args.github_token
+                    )
+                    return select_important_files(all_files)
+                except Exception as exc:
+                    print(f"Warning: Could not fetch compare diff: {exc}", file=sys.stderr)
+                    return []
+
+            def _do_commit_fetch() -> List[CommitInfo]:
+                if not compare:
+                    return []
+                try:
+                    all_commits = fetch_compare_commits(
+                        args.repo, compare.tag_name, target.tag_name, args.github_token
+                    )
+                    return select_relevant_commits(all_commits)
+                except Exception as exc:
+                    print(f"Warning: Could not fetch compare commits: {exc}", file=sys.stderr)
+                    return []
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                future_analysis = executor.submit(_do_rule_analysis)
+                future_diff = executor.submit(_do_diff_fetch)
+                future_commits = executor.submit(_do_commit_fetch)
+                analyses = future_analysis.result()
+                diff_files = future_diff.result()
+                commits = future_commits.result()
+
+            # Build single master analysis data file
+            data = build_analysis_data(
+                args.repo, target, compare, analyses, commits, diff_files, _lang
+            )
+            data_path = analysis_data_path(snapshot_dir, args.repo, target.tag_name)
+            write_analysis_data(data, data_path)
+
+            base_path = base_analysis_path(snapshot_dir, args.repo, target.tag_name)
+            write_base_analysis(analyses, base_path)
+
+            # Auto-evaluate whether chunking is needed
+            needs_chunking, est_tokens = should_use_chunking(data)
+
+            if needs_chunking or args.prepare_chunks:
+                # Automatic chunking: split data into chunks for distributed processing
+                chunk_paths = split_analysis_data_into_chunks(
+                    data, snapshot_dir, args.repo, target.tag_name
+                )
+                print(f"ANALYSIS_DATA_READY: 1")
+                print(f"DATA: {data_path}")
+                print(f"BASE_ANALYSIS: {base_path}")
+                print(f"CHUNKING_REQUIRED: 1")
+                print(f"ESTIMATED_TOKENS: {est_tokens}")
+                print(f"CHUNK_COUNT: {len(chunk_paths)}")
+                for i, cp in enumerate(chunk_paths):
+                    print(f"CHUNK_{i}: {cp}")
+                print(f"MERGE_COMMAND: --merge-chunk-results")
+                # Auto-detect existing chunk results
+                existing_results = discover_chunk_results(snapshot_dir, args.repo, target.tag_name)
+                if existing_results:
+                    print(f"CHUNK_RESULTS_FOUND: {len(existing_results)}")
+                    for i, rp in enumerate(existing_results):
+                        print(f"CHUNK_RESULT_{i}: {rp}")
+            else:
+                print(f"ANALYSIS_DATA_READY: 1")
+                print(f"DATA: {data_path}")
+                print(f"BASE_ANALYSIS: {base_path}")
+                print(f"CHUNKING_REQUIRED: 0")
+                print(f"ESTIMATED_TOKENS: {est_tokens}")
+
+            # Auto-detect existing llm-results.json from previous run
+            results_path = llm_results_path(snapshot_dir, args.repo, target.tag_name)
+            if results_path.exists():
+                print(f"LLM_RESULTS_CACHED: {results_path}")
+
+            return 0
+
+        # -------------------------------------------------------------------
+        # Internal helper: merge chunk results
+        # -------------------------------------------------------------------
+        def _run_merge_chunk_results_mode() -> int:
+            target_for_path = args.target or "latest-stable"
+            if target_for_path == "latest-stable" and not args.target:
+                try:
+                    _releases = fetch_releases(args.repo, args.github_token)
+                    _stable = stable_releases(_releases)
+                    if _stable:
+                        target_for_path = _stable[0].tag_name
+                except Exception:
+                    pass
+
+            chunk_results = discover_chunk_results(snapshot_dir, args.repo, target_for_path)
+            if not chunk_results:
+                print(f"Error: No chunk result files found for {args.repo} {target_for_path}", file=sys.stderr)
+                print(f"Searched in: {snapshot_dir}", file=sys.stderr)
+                return 1
+
+            output_path = llm_results_path(snapshot_dir, args.repo, target_for_path)
+            merge_chunk_results(chunk_results, output_path)
+            print(f"CHUNK_MERGE_COMPLETE: 1")
+            print(f"LLM_RESULTS: {output_path}")
+            return 0
+
+        # -------------------------------------------------------------------
+        # Mode A: Prepare analysis data and exit
+        # -------------------------------------------------------------------
+        if args.prepare_analysis_data or args.generate_llm_prompt or args.prepare_chunks:
+            return _run_prepare_analysis_data_mode()
+
+        # -------------------------------------------------------------------
+        # Mode A.5: Merge chunk results
+        # -------------------------------------------------------------------
+        if args.merge_chunk_results:
+            return _run_merge_chunk_results_mode()
+
+        # -------------------------------------------------------------------
+        # Mode C: Default — token-aware routing (check BEFORE Mode B)
+        # -------------------------------------------------------------------
+        # If token is valid and not --no-llm, auto-trigger analysis data preparation
+        if token_valid and not args.no_llm and not args.apply_llm_results:
+            # Resolve actual target tag for cache path (handles --latest mode)
+            target_for_path = args.target
+            if not target_for_path:
+                try:
+                    _releases = fetch_releases(args.repo, args.github_token)
+                    _stable = stable_releases(_releases)
+                    if _stable:
+                        target_for_path = _stable[0].tag_name
+                except Exception:
+                    pass
+            if not target_for_path:
+                target_for_path = "latest-stable"
+
+            # Check if cached llm-results.json exists from a previous run
+            results_path = llm_results_path(snapshot_dir, args.repo, target_for_path)
+            if results_path.exists():
+                print(
+                    f"Info: Found cached LLM results at {results_path}; applying directly.",
+                    file=sys.stderr,
+                )
+                args.apply_llm_results = str(results_path)
+                # Continue to Mode B below
+            else:
+                print(
+                    "Info: Valid token detected; entering LLM-enhanced analysis mode.",
+                    file=sys.stderr,
+                )
+                return _run_prepare_analysis_data_mode()
+
+        # -------------------------------------------------------------------
+        # Mode B: Apply LLM results and generate final report
+        # -------------------------------------------------------------------
+        if args.apply_llm_results:
+            llm_results_file = Path(args.apply_llm_results)
+            if not llm_results_file.exists():
+                raise RuntimeError(f"LLM results file not found: {llm_results_file}")
+
+            # P1: Avoid re-fetching from GitHub API — use cached snapshot if available
+            target, compare, scoped, releases, snapshot = _load_snapshot_or_fetch(args)
+            lang = _resolve_lang(args)
+
+            # Load cached base analysis or recompute (for fallback / no-llm mode)
+            base_path = base_analysis_path(snapshot_dir, args.repo, target.tag_name)
+            if base_path.exists():
+                analyses = read_base_analysis(base_path)
+            else:
+                analyses = analyze_release_notes(scoped, lang)
+            categories = _build_categories_from_analyses(analyses)
+
+            # Parse LLM full report (LLM performs ALL semantic analysis)
+            llm_report = parse_llm_results(llm_results_file)
+
+            # Generate report using LLM output directly
+            if args.output:
+                output_path = Path(args.output)
+            else:
+                output_path = Path.cwd() / f"{snapshot.stem}-analysis.md"
+
+            report = render_report(
+                repo=args.repo,
+                target=target,
+                compare=compare,
+                scoped=scoped,
+                releases=releases,
+                include_beta=args.include_beta,
+                lang=lang,
+                data_source="Fresh GitHub Releases API + Compare Diff + LLM analysis",
+                snapshot_file=str(snapshot),
+                output_file=str(output_path),
+                analyses=analyses,
+                categories=categories,
+                llm_report=llm_report,
+            )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(report, encoding="utf-8")
+            print(str(output_path))
+
+            # Clean up step-internal transient files after report generation
+            _cleanup_transient_files(snapshot_dir, args.repo, target.tag_name)
+            return 0
+
+        # Rule-based analysis only (token missing/invalid or --no-llm)
+        target, compare, scoped, releases, snapshot = refresh_snapshot_and_load(args)
+        _lang = _resolve_lang(args)
+        _strings = _zh() if _lang == "zh" else _en()
+
+        classified = [classify_release(r) for r in scoped]
+        categories = merge_categories(classified)
+        analyses = analyze_release_notes(scoped, _lang)
+
+        # Default output to current working directory
+        if args.output:
+            output_path = Path(args.output)
+        else:
+            output_path = Path.cwd() / f"{snapshot.stem}-analysis.md"
+
+        report = render_report(
+            repo=args.repo,
+            target=target,
+            compare=compare,
+            scoped=scoped,
+            releases=releases,
+            include_beta=args.include_beta,
+            lang=_lang,
+            data_source=_strings["analysis_mode_rule_only"],
+            snapshot_file=str(snapshot),
+            output_file=str(output_path),
+            analyses=analyses,
+            categories=categories,
+        )
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(report, encoding="utf-8")
+        print(str(output_path))
+
+        # Clean up step-internal transient files after report generation
+        _cleanup_transient_files(snapshot_dir, args.repo, target.tag_name)
+        return 0
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

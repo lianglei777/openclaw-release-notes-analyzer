@@ -278,300 +278,189 @@ def _build_llm_instructions(lang: str) -> str:
     The LLM outputs a COMPLETE analysis report in structured JSON.
     The script merely parses and renders it.
     """
-    if lang == "zh":
-        return (
-            "你是一个资深的 OpenClaw release notes 分析师。OpenClaw 是一款插件化 AI 助手框架。\n\n"
-            "我会提供三部分原始数据（未经过任何预分析）：\n"
-            "1. release_notes: 本次分析范围内的所有 release note（仅原始文本，每条有 ID: R-001, R-002...）。"
-            "每条 note 都有 source_version 字段，标注该 note 来自哪个 release tag（如 v2026.4.12）。"
-            "如果分析范围包含多个版本，source_version 能帮你判断变更是在哪个中间版本引入的。\n"
-            "2. commits: 版本间的 commit 列表（含 commit message 和改动文件路径）\n"
-            "3. code_changes: 代码变更统计摘要（按目录聚合 + 关键文件）\n\n"
-            "==== 你的任务 ====\n\n"
-            "基于以上原始数据，完成完整的 release analysis。所有分析必须由你自主完成，"
-            "不要依赖任何外部预分类。\n\n"
-            "==== 第一阶段：主题聚类 ====\n\n"
-            "将 release_notes 按语义聚类为 8-15 个主题。聚类标准：\n"
-            "- 同一功能模块的同类变更（如所有 Gemini ID 规范化相关条目）\n"
-            "- 同一安全修复的多处加固（如 OAuth 相关修复）\n"
-            "- 同一依赖升级触发的连锁变更（如 pnpm 11 迁移）\n"
-            "- 同一组件的配套调整（如 Feishu 的认证+消息+线程相关变更）\n"
-            "- 不要按组件机械分组；按\"功能意图\"分组\n"
-            "- 尽量让每个 note 都属于一个主题，不要漏掉\n\n"
-            "==== 跨版本分析（如 source_version 显示多个版本）====\n\n"
-            "如果 release_notes 来自多个版本，请在分析中特别关注以下两类跨版本模式：\n\n"
-            "**渐进式修复检测（Optimization #3）**：\n"
-            "- 识别同一个 bug/问题是否被分多个版本逐步修复\n"
-            "- 典型模式：v1 引入临时缓解 → v2 部分修复 → v3 完整修复\n"
-            "- 也包含：早期版本引入的问题在后续版本中被修复（regression-fix 链）\n"
-            "- 每个渐进式修复链必须标注：问题描述、每个阶段的版本和 note_id、修复完整度（partial/mitigation/complete）、最终状态\n"
-            "- 注意：一个 note 可能同时属于某个主题和某个渐进式修复链，这是正常的\n\n"
-            "**累积 Breaking Change 分析（Optimization #4）**：\n"
-            "- 评估跨版本升级路径上的累积兼容性风险\n"
-            "- 核心判断：单个版本看起来低风险，但多个版本的 breaking change 叠加后，整体影响是否被低估\n"
-            "- 关注信号：同一组件在多个版本中持续调整接口/行为；早期版本的废弃项在后续版本中真正移除；多个版本的配置变更叠加后需要多次迁移\n"
-            "- 必须输出 individual_risk（单版本风险）vs cumulative_risk（累积风险），并解释 risk_escalation_reason\n"
-            "- 在 theme 的 reasoning 中标注该主题涉及的版本范围\n\n"
-            "==== 第二阶段：主题级分析 ====\n\n"
-            "对每个主题进行深度分析：\n"
-            "- 主题整体风险级别（high/medium/low），以最高风险条目为准\n"
-            "- 与主题语义直接对应的 commits（最多 3 个）\n"
-            "- 该主题涉及的关键文件路径（最多 5 个）\n"
-            "- 是否有隐藏的 breaking change（commit 揭示了 note 未提及的内容）\n"
-            "- 判断依据：必须引用具体的 commit message 原文片段和文件路径\n\n"
-            "==== 第三阶段：逐条深度分析（仅对高风险/有 commit 匹配的条目）====\n\n"
-            "对以下条目做逐条深度分析：\n"
-            "1. 主题风险为 high 的所有条目\n"
-            "2. 有 matched_commits 的 medium 风险条目\n"
-            "3. 有 hidden_breaking 信号的条目\n\n"
-            "逐条分析要求：\n"
-            "- component: 推断该条目所属的组件/模块\n"
-            "- categories: 判断主分类（breaking/security/plugin/api_sdk/cli/config/dependency/performance/fix/feature/docs/other）\n"
-            "- risk_level: 独立判断风险级别\n"
-            "- interpretation: 写出有深度的变更解读，不要模板化。要回答\"这个变更具体改了什么\"\"对现有用户有什么影响\"\"需要做什么来适配\"\n"
-            "- action_items: 给出 2-3 条具体、可操作的建议动作\n"
-            "- audience: 判断主要影响哪些人\n"
-            "- matched_commits: 直接对应的 commit SHA\n"
-            "- affected_files: 受影响文件路径\n"
-            "- reasoning: 引用 commit message 原文作为判断依据\n\n"
-            "==== 第四阶段：生成完整报告内容 ====\n\n"
-            "基于以上分析，生成报告所需的全部章节内容：\n\n"
-            "1. 执行摘要（executive_summary）：\n"
-            "   - recommendation: 升级建议（建议升级/谨慎升级/暂缓升级）\n"
-            "   - theme: 核心主题（15字以内，概括本次更新最大特点）\n"
-            "   - magnitude: 变化量级（大/中/小）\n"
-            "   - reason: 建议理由（50字以内）\n"
-            "   - top_changes: Top 5 最关键变化，每条包含 note_id + text 摘要 + risk + categories\n"
-            "   - one_liner: 一句话判断（面向决策者的极简结论）\n\n"
-            "2. 开发者结论（developer_conclusion）：\n"
-            "   - 面向 Channel/插件开发者的一句话结论（50字以内）\n"
-            "   - 要具体，不要模板。例如\"Feishu 认证流程从 QR 扫码改为手动配置，需要重新绑定\"\n\n"
-            "3. 兼容性风险（compatibility_risks）：\n"
-            "   - 每个高风险主题的兼容性风险描述\n"
-            "   - 要具体说明什么会 break、为什么、怎么验证\n"
-            "   - 不要写\"存在兼容性风险\"这种空话\n\n"
-            "4. 测试建议（test_points）：\n"
-            "   - 基于主题分析生成的具体测试点\n"
-            "   - 每条测试点要可操作，例如\"用旧版 Feishu QR 配置验证升级后是否需要重新手动配置\"\n\n"
-            "5. 未记录变更（shadow_changes）：\n"
-            "   - commits 有但 release notes 没提的 public surface 变更\n"
-            "   - 忽略纯内部重构、测试、文档类 commit\n\n"
-            "6. 渐进式修复检测（progressive_fixes，仅在多版本时输出）：\n"
-            "   - 每个修复链包含：fix_id、issue_description（问题描述）、stages（阶段列表，每阶段含 note_id/source_version/fix_description/completeness）、final_status、impact_assessment\n"
-            "   - completeness 取值：mitigation（缓解）/ partial（部分修复）/ complete（完整修复）\n"
-            "   - final_status 取值：fully_fixed（已完全修复）/ partially_fixed（仍部分修复）/ mitigated（仅缓解）\n"
-            "   - 如果没有检测到渐进式修复，输出空数组 []\n\n"
-            "7. 累积 Breaking Change 分析（version_evolution，仅在多版本时输出）：\n"
-            "   - 每个演进条目包含：evolution_id、description（演进描述）、affected_versions（版本范围）、individual_risk（单版本风险）、cumulative_risk（累积风险）、risk_escalation_reason（为什么累积风险更高）、related_themes（关联主题ID）、affected_components、migration_advice\n"
-            "   - risk_escalation_reason 是核心字段，必须具体说明为什么\"跨多个版本升级\"比\"逐个版本升级\"更危险\n"
-            "   - 例如：\"v2026.4.10 废弃了旧 QR 绑定方式，v2026.4.11 修改了默认 auth 流程，v2026.4.12 完全移除 QR 支持。单个版本看都是渐进式调整，但跨越三个版本直接升级需要同时处理废弃通知、行为变化和接口移除三重影响，且没有中间版本的迁移缓冲\"\n"
-            "   - 如果没有检测到累积风险，输出空数组 []\n\n"
-            "==== 输出格式 ====\n\n"
-            "JSON 对象，顶层字段如下：\n"
-            "{\n"
-            '  "executive_summary": {\n'
-            '    "recommendation": "建议升级",\n'
-            '    "theme": "安全加固与认证重构",\n'
-            '    "magnitude": "大",\n'
-            '    "reason": "包含多个安全修复和 OAuth 流程调整",\n'
-            '    "top_changes": [\n'
-            '      {"note_id": "R-001", "text": "Plugins/doctor: drop stale npm install records...", "risk": "high", "categories": ["breaking", "plugin"]}\n'
-            '    ],\n'
-            '    "one_liner": "本版包含 Feishu 认证流程 breaking change，需要重新配置后再升级。"\n'
-            '  },\n'
-            '  "developer_conclusion": "这是一版带兼容性包袱的更新，Feishu 认证从 QR 改为手动配置，Plugins/doctor 会清理 stale npm records。升级前先验证配置和插件兼容性。",\n'
-            '  "themes": [\n'
-            '    {\n'
-            '      "theme_id": "T-01",\n'
-            '      "theme_name": "Feishu 认证流程重构",\n'
-            '      "note_ids": ["R-002", "R-067", "R-385", "R-432"],\n'
-            '      "primary_category": "security",\n'
-            '      "risk_level": "high",\n'
-            '      "summary": "Feishu 默认认证路径从 QR 扫码改为手动 App ID 配置",\n'
-            '      "impact": "已绑定 Feishu 的用户需要重新走手动配置流程",\n'
-            '      "related_commits": ["abc1234"],\n'
-            '      "affected_files": ["src/channels/feishu/auth.ts"],\n'
-            '      "confidence": "high",\n'
-            '      "has_hidden_breaking": false,\n'
-            '      "hidden_risks": "",\n'
-            '      "reasoning": "commit abc1234 message \"feat(feishu): switch default auth to manual app id\" 直接对应"\n'
-            '    }\n'
-            '  ],\n'
-            '  "detailed_notes": [\n'
-            '    {\n'
-            '      "note_id": "R-001",\n'
-            '      "component": "Plugins/doctor",\n'
-            '      "categories": ["breaking", "plugin", "dependency"],\n'
-            '      "risk_level": "high",\n'
-            '      "interpretation": "doctor --fix 现在会删除 shadow bundled plugin 的 stale npm records。这意味着如果之前 doctor 修复过插件问题，升级后 registry 状态可能变化，需要验证插件是否正常加载。",\n'
-            '      "action_items": ["运行 openclaw doctor --fix 观察是否有插件被清理", "验证关键插件在升级后是否正常加载"],\n'
-            '      "audience": ["插件开发者", "运维人员"],\n'
-            '      "matched_commits": ["def5678"],\n'
-            '      "affected_files": ["src/plugins/doctor.ts"],\n'
-            '      "has_hidden_breaking": false,\n'
-            '      "reasoning": "commit def5678 message \"fix(doctor): drop stale managed npm install records\" 与 note 直接对应"\n'
-            '    }\n'
-            '  ],\n'
-            '  "compatibility_risks": [\n'
-            '    {"component": "Feishu", "description": "QR 扫码绑定失效，需要手动配置 App ID/App Secret。如果生产环境已绑定 Feishu，升级后 channel 会断连，需要提前准备手动配置流程。"}\n'
-            '  ],\n'
-            '  "test_points": [\n'
-            '    "用旧版 Feishu QR 配置验证升级后是否需要重新手动配置",\n'
-            '    "运行 openclaw doctor --fix 观察插件清理行为",\n'
-            '    "验证插件安装/卸载后 peer dependency 是否正确清理"\n'
-            '  ],\n'
-            '  "shadow_changes": [\n'
-            '    {"description": "commit ghi9012 新增了未在 release notes 中提及的 OAuth 回调接口", "evidence_commits": ["ghi9012"]}\n'
-            '  ],\n'
-            '  "progressive_fixes": [\n'
-            '    {\n'
-            '      "fix_id": "PF-01",\n'
-            '      "issue_description": "Feishu 认证在特定场景下 token 刷新失败",\n'
-            '      "stages": [\n'
-            '        {"note_id": "R-015", "source_version": "v2026.4.10", "fix_description": "增加 token 刷新重试次数", "completeness": "mitigation"},\n'
-            '        {"note_id": "R-042", "source_version": "v2026.4.11", "fix_description": "修复 refresh 逻辑中的竞态条件", "completeness": "partial"},\n'
-            '        {"note_id": "R-089", "source_version": "v2026.4.12", "fix_description": "重构 Feishu auth 模块，彻底消除 token 刷新问题", "completeness": "complete"}\n'
-            '      ],\n'
-            '      "final_status": "fully_fixed",\n'
-            '      "impact_assessment": "从 v2026.4.10 升级到 v2026.4.12 可完全解决该问题；若停留在中间版本，仍可能遇到偶发认证失败",\n'
-            '      "affected_components": ["Feishu", "Auth"]\n'
-            '    }\n'
-            '  ],\n'
-            '  "version_evolution": [\n'
-            '    {\n'
-            '      "evolution_id": "VE-01",\n'
-            '      "description": "Feishu 认证接口经历三次连续调整",\n'
-            '      "affected_versions": ["v2026.4.10", "v2026.4.11", "v2026.4.12"],\n'
-            '      "individual_risk": "low",\n'
-            '      "cumulative_risk": "high",\n'
-            '      "risk_escalation_reason": "v2026.4.10 废弃了旧 QR 绑定方式，v2026.4.11 修改了默认 auth 流程，v2026.4.12 完全移除 QR 支持。单个版本看都是渐进式调整，但跨越三个版本直接升级需要同时处理废弃通知、行为变化和接口移除三重影响，且没有中间版本的迁移缓冲",\n'
-            '      "related_themes": ["T-01"],\n'
-            '      "affected_components": ["Feishu", "Auth"],\n'
-            '      "migration_advice": "建议分步升级：先升级到 v2026.4.11 完成手动配置迁移，验证无误后再升级到 v2026.4.12。不要跨两个中间版本直接升级。"\n'
-            '    }\n'
-            '  ]\n'
-            "}\n\n"
-            "关键要求：\n"
-            "1) interpretation 必须有深度，回答\"改了什么\"\"有什么影响\"\"怎么办\"三个问题\n"
-            "2) 不要写模板化内容（如\"这项更新对 X 发出了兼容性信号\"）\n"
-            "3) 保守评估风险——不确定时取更高风险级别\n"
-            "4) reasoning 必须引用具体的 commit message 原文片段\n"
-            "5) 不要强行关联不相关的 commit\n"
-            "6) 不要编造不存在的变更\n"
-            "7) 主题名要简洁具体，不要用\"其他变更\"\"杂项\"\n"
-            "8) progressive_fixes 和 version_evolution 只在分析范围包含多个版本时输出；单版本分析输出空数组 []\n"
-            "9) risk_escalation_reason 必须具体，不能写\"多个变更叠加导致风险增加\"这种空话"
-        )
-    else:
-        return (
-            "You are a senior OpenClaw release notes analyst. OpenClaw is a plugin-based AI assistant framework.\n\n"
-            "I will provide three raw data sections (NO pre-analysis):\n"
-            "1. release_notes: All release notes in the analysis scope (raw text only, each with an ID: R-001, R-002...). "
-            "Each note has a source_version field indicating which release tag it comes from (e.g., v2026.4.12). "
-            "If the analysis scope spans multiple versions, source_version helps you determine which intermediate version introduced a change.\n"
-            "2. commits: Commits between versions (with messages and changed file paths)\n"
-            "3. code_changes: Code change statistics (directory-level aggregation + key files)\n\n"
-            "==== Your Task ====\n\n"
-            "Complete a full release analysis based on the raw data above. ALL analysis must be performed by you; "
-            "do not rely on any external pre-classification.\n\n"
-            "==== Phase 1: Thematic Clustering ====\n\n"
-            "Cluster release_notes into 8-15 semantic themes by functional intent:\n"
-            "- Same functional module, same type of change\n"
-            "- Same security fix applied in multiple places\n"
-            "- Dependency upgrade cascading changes\n"
-            "- Coordinated adjustments to the same component\n"
-            "- Do NOT group mechanically by component\n"
-            "- Include every note in a theme; do not leave notes unclassified\n\n"
-            "==== Cross-Version Analysis (when source_version shows multiple versions) ====\n\n"
-            "If release_notes come from multiple versions, pay special attention to the following cross-version patterns:\n\n"
-            "**Progressive Fix Detection (Optimization #3):**\n"
-            "- Identify whether the same bug/issue was fixed incrementally across multiple versions\n"
-            "- Typical pattern: v1 introduces temporary mitigation → v2 partial fix → v3 complete fix\n"
-            "- Also includes: issues introduced in early versions that were fixed in later versions (regression-fix chains)\n"
-            "- Each progressive fix chain must include: issue description, stages (note_id/source_version/fix_description/completeness per stage), final status, impact assessment\n"
-            "- Note: a single note may belong to both a theme and a progressive fix chain — this is normal\n\n"
-            "**Cumulative Breaking Change Analysis (Optimization #4):**\n"
-            "- Assess cumulative compatibility risk across the upgrade path\n"
-            "- Core judgment: individual versions may appear low-risk, but do multiple breaking changes compound into an underestimated aggregate impact?\n"
-            "- Watch for signals: same component adjusted across multiple versions; early deprecation followed by actual removal in later versions; multiple config changes requiring successive migrations\n"
-            "- Must output individual_risk (per-version) vs cumulative_risk (across the range), with risk_escalation_reason explaining why\n"
-            "- Annotate the version range involved in each theme's reasoning\n\n"
-            "==== Phase 2: Theme-Level Analysis ====\n\n"
-            "For each theme, perform deep analysis:\n"
-            "- Overall theme risk level (high/medium/low)\n"
-            "- Commits that directly correspond to this theme (max 3)\n"
-            "- Key file paths involved (max 5)\n"
-            "- Hidden breaking changes (commit reveals something notes didn't mention)\n"
-            "- Judgment rationale quoting specific commit message snippets\n\n"
-            "==== Phase 3: Per-Note Deep Analysis (high-risk / commit-matched only) ====\n\n"
-            "For each note requiring deep analysis:\n"
-            "- component: Infer the component/module\n"
-            "- categories: Determine primary category\n"
-            "- risk_level: Independent risk judgment\n"
-            "- interpretation: Write a DEEP analysis. Answer: WHAT changed, WHAT is the impact, WHAT to do about it. NO templates.\n"
-            "- action_items: 2-3 specific, actionable recommendations\n"
-            "- audience: Who is primarily affected\n"
-            "- matched_commits: Directly corresponding commit SHAs\n"
-            "- affected_files: Affected file paths\n"
-            "- reasoning: Quote commit message snippets as evidence\n\n"
-            "==== Phase 4: Generate Complete Report Content ====\n\n"
-            "Based on the analysis above, generate ALL report sections:\n\n"
-            "1. executive_summary:\n"
-            "   - recommendation: Recommend Upgrade / Upgrade with Caution / Defer\n"
-            "   - theme: Core theme (within 15 words)\n"
-            "   - magnitude: Large / Medium / Small\n"
-            "   - reason: Rationale (within 50 words)\n"
-            "   - top_changes: Top 5 most critical changes (note_id + text summary + risk + categories)\n"
-            "   - one_liner: One-sentence judgment for decision makers\n\n"
-            "2. developer_conclusion:\n"
-            "   - One-sentence conclusion for channel/plugin developers (within 50 words)\n"
-            "   - Be specific, not templated\n\n"
-            "3. compatibility_risks:\n"
-            "   - Per high-risk theme: specific risk description\n"
-            "   - Explain WHAT will break, WHY, and HOW to verify\n"
-            "   - No vague statements like \"compatibility risk exists\"\n\n"
-            "4. test_points:\n"
-            "   - Specific, actionable test items based on theme analysis\n"
-            "   - Each test point must be verifiable\n\n"
-            "5. shadow_changes:\n"
-            "   - Public surface changes present in commits but absent from release notes\n"
-            "   - Ignore internal refactoring, tests, docs commits\n\n"
-            "6. progressive_fixes (only when multiple versions are in scope):\n"
-            "   - Each fix chain includes: fix_id, issue_description, stages (list with note_id/source_version/fix_description/completeness per stage), final_status, impact_assessment\n"
-            "   - completeness values: mitigation / partial / complete\n"
-            "   - final_status values: fully_fixed / partially_fixed / mitigated\n"
-            "   - Output empty array [] if no progressive fixes detected\n\n"
-            "7. version_evolution (only when multiple versions are in scope):\n"
-            "   - Each evolution entry includes: evolution_id, description, affected_versions, individual_risk (per-version), cumulative_risk (across range), risk_escalation_reason (why cumulative > individual), related_themes, affected_components, migration_advice\n"
-            "   - risk_escalation_reason is the CORE field — must specifically explain why upgrading across multiple versions at once is riskier than upgrading version-by-version\n"
-            "   - Example: \"v1 deprecated the old QR binding, v2 changed default auth flow, v3 fully removed QR support. Individually each is a gradual adjustment, but jumping from v0 to v3 requires handling deprecation notice, behavior change, and API removal all at once, with no intermediate migration buffer\"\n"
-            "   - Output empty array [] if no cumulative risk detected\n\n"
-            "==== Output Format ====\n\n"
-            "JSON object with these top-level fields:\n"
-            "{\n"
-            '  "executive_summary": {...},\n'
-            '  "developer_conclusion": "...",\n'
-            '  "themes": [...],\n'
-            '  "detailed_notes": [...],\n'
-            '  "compatibility_risks": [...],\n'
-            '  "test_points": [...],\n'
-            '  "shadow_changes": [...],\n'
-            '  "progressive_fixes": [...],\n'
-            '  "version_evolution": [...]\n'
-            "}\n\n"
-            "Critical requirements:\n"
-            "1) interpretation must be DEEP — answer WHAT changed, WHAT is the impact, WHAT to do\n"
-            "2) NO templated content (e.g., \"this change carries compatibility signals for X\")\n"
-            "3) Conservative risk assessment — when uncertain, choose higher risk\n"
-            "4) reasoning MUST quote specific commit message snippets\n"
-            "5) Do not force associations for unrelated commits\n"
-            "6) Do not invent changes\n"
-            "7) Theme names must be concise and specific; avoid vague names like \"Other Changes\"\n"
-            "8) progressive_fixes and version_evolution only output when analysis scope spans multiple versions; single-version analysis outputs empty arrays []\n"
-            "9) risk_escalation_reason must be specific — never write \"multiple changes compound risk\" as a generic statement"
-        )
-
-
+    return (
+        "你是一个资深的 OpenClaw release notes 分析师。OpenClaw 是一款插件化 AI 助手框架。\n\n"
+        "我会提供三部分原始数据（未经过任何预分析）：\n"
+        "1. release_notes: 本次分析范围内的所有 release note（仅原始文本，每条有 ID: R-001, R-002...）。"
+        "每条 note 都有 source_version 字段，标注该 note 来自哪个 release tag（如 v2026.4.12）。"
+        "如果分析范围包含多个版本，source_version 能帮你判断变更是在哪个中间版本引入的。\n"
+        "2. commits: 版本间的 commit 列表（含 commit message 和改动文件路径）\n"
+        "3. code_changes: 代码变更统计摘要（按目录聚合 + 关键文件）\n\n"
+        "==== 你的任务 ====\n\n"
+        "基于以上原始数据，完成完整的 release analysis。所有分析必须由你自主完成，"
+        "不要依赖任何外部预分类。\n\n"
+        "==== 第一阶段：主题聚类 ====\n\n"
+        "将 release_notes 按语义聚类为 8-15 个主题。聚类标准：\n"
+        "- 同一功能模块的同类变更（如所有 Gemini ID 规范化相关条目）\n"
+        "- 同一安全修复的多处加固（如 OAuth 相关修复）\n"
+        "- 同一依赖升级触发的连锁变更（如 pnpm 11 迁移）\n"
+        "- 同一组件的配套调整（如 Feishu 的认证+消息+线程相关变更）\n"
+        "- 不要按组件机械分组；按\"功能意图\"分组\n"
+        "- 尽量让每个 note 都属于一个主题，不要漏掉\n\n"
+        "==== 跨版本分析（如 source_version 显示多个版本）====\n\n"
+        "如果 release_notes 来自多个版本，请在分析中特别关注以下两类跨版本模式：\n\n"
+        "**渐进式修复检测（Optimization #3）**：\n"
+        "- 识别同一个 bug/问题是否被分多个版本逐步修复\n"
+        "- 典型模式：v1 引入临时缓解 → v2 部分修复 → v3 完整修复\n"
+        "- 也包含：早期版本引入的问题在后续版本中被修复（regression-fix 链）\n"
+        "- 每个渐进式修复链必须标注：问题描述、每个阶段的版本和 note_id、修复完整度（partial/mitigation/complete）、最终状态\n"
+        "- 注意：一个 note 可能同时属于某个主题和某个渐进式修复链，这是正常的\n\n"
+        "**累积 Breaking Change 分析（Optimization #4）**：\n"
+        "- 评估跨版本升级路径上的累积兼容性风险\n"
+        "- 核心判断：单个版本看起来低风险，但多个版本的 breaking change 叠加后，整体影响是否被低估\n"
+        "- 关注信号：同一组件在多个版本中持续调整接口/行为；早期版本的废弃项在后续版本中真正移除；多个版本的配置变更叠加后需要多次迁移\n"
+        "- 必须输出 individual_risk（单版本风险）vs cumulative_risk（累积风险），并解释 risk_escalation_reason\n"
+        "- 在 theme 的 reasoning 中标注该主题涉及的版本范围\n\n"
+        "==== 第二阶段：主题级分析 ====\n\n"
+        "对每个主题进行深度分析：\n"
+        "- 主题整体风险级别（high/medium/low），以最高风险条目为准\n"
+        "- 与主题语义直接对应的 commits（最多 3 个）\n"
+        "- 该主题涉及的关键文件路径（最多 5 个）\n"
+        "- 是否有隐藏的 breaking change（commit 揭示了 note 未提及的内容）\n"
+        "- 判断依据：必须引用具体的 commit message 原文片段和文件路径\n\n"
+        "==== 第三阶段：逐条深度分析（仅对高风险/有 commit 匹配的条目）====\n\n"
+        "对以下条目做逐条深度分析：\n"
+        "1. 主题风险为 high 的所有条目\n"
+        "2. 有 matched_commits 的 medium 风险条目\n"
+        "3. 有 hidden_breaking 信号的条目\n\n"
+        "逐条分析要求：\n"
+        "- component: 推断该条目所属的组件/模块\n"
+        "- categories: 判断主分类（breaking/security/plugin/api_sdk/cli/config/dependency/performance/fix/feature/docs/other）\n"
+        "- risk_level: 独立判断风险级别\n"
+        "- interpretation: 写出有深度的变更解读，不要模板化。要回答\"这个变更具体改了什么\"\"对现有用户有什么影响\"\"需要做什么来适配\"\n"
+        "- action_items: 给出 2-3 条具体、可操作的建议动作\n"
+        "- audience: 判断主要影响哪些人\n"
+        "- matched_commits: 直接对应的 commit SHA\n"
+        "- affected_files: 受影响文件路径\n"
+        "- reasoning: 引用 commit message 原文作为判断依据\n\n"
+        "==== 第四阶段：生成完整报告内容 ====\n\n"
+        "基于以上分析，生成报告所需的全部章节内容：\n\n"
+        "1. 执行摘要（executive_summary）：\n"
+        "   - recommendation: 升级建议（建议升级/谨慎升级/暂缓升级）\n"
+        "   - theme: 核心主题（15字以内，概括本次更新最大特点）\n"
+        "   - magnitude: 变化量级（大/中/小）\n"
+        "   - reason: 建议理由（50字以内）\n"
+        "   - top_changes: Top 5 最关键变化，每条包含 note_id + text 摘要 + risk + categories\n"
+        "   - one_liner: 一句话判断（面向决策者的极简结论）\n\n"
+        "2. 开发者结论（developer_conclusion）：\n"
+        "   - 面向 Channel/插件开发者的一句话结论（50字以内）\n"
+        "   - 要具体，不要模板。例如\"Feishu 认证流程从 QR 扫码改为手动配置，需要重新绑定\"\n\n"
+        "3. 兼容性风险（compatibility_risks）：\n"
+        "   - 每个高风险主题的兼容性风险描述\n"
+        "   - 要具体说明什么会 break、为什么、怎么验证\n"
+        "   - 不要写\"存在兼容性风险\"这种空话\n\n"
+        "4. 测试建议（test_points）：\n"
+        "   - 基于主题分析生成的具体测试点\n"
+        "   - 每条测试点要可操作，例如\"用旧版 Feishu QR 配置验证升级后是否需要重新手动配置\"\n\n"
+        "5. 未记录变更（shadow_changes）：\n"
+        "   - commits 有但 release notes 没提的 public surface 变更\n"
+        "   - 忽略纯内部重构、测试、文档类 commit\n\n"
+        "6. 渐进式修复检测（progressive_fixes，仅在多版本时输出）：\n"
+        "   - 每个修复链包含：fix_id、issue_description（问题描述）、stages（阶段列表，每阶段含 note_id/source_version/fix_description/completeness）、final_status、impact_assessment\n"
+        "   - completeness 取值：mitigation（缓解）/ partial（部分修复）/ complete（完整修复）\n"
+        "   - final_status 取值：fully_fixed（已完全修复）/ partially_fixed（仍部分修复）/ mitigated（仅缓解）\n"
+        "   - 如果没有检测到渐进式修复，输出空数组 []\n\n"
+        "7. 累积 Breaking Change 分析（version_evolution，仅在多版本时输出）：\n"
+        "   - 每个演进条目包含：evolution_id、description（演进描述）、affected_versions（版本范围）、individual_risk（单版本风险）、cumulative_risk（累积风险）、risk_escalation_reason（为什么累积风险更高）、related_themes（关联主题ID）、affected_components、migration_advice\n"
+        "   - risk_escalation_reason 是核心字段，必须具体说明为什么\"跨多个版本升级\"比\"逐个版本升级\"更危险\n"
+        "   - 例如：\"v2026.4.10 废弃了旧 QR 绑定方式，v2026.4.11 修改了默认 auth 流程，v2026.4.12 完全移除 QR 支持。单个版本看都是渐进式调整，但跨越三个版本直接升级需要同时处理废弃通知、行为变化和接口移除三重影响，且没有中间版本的迁移缓冲\"\n"
+        "   - 如果没有检测到累积风险，输出空数组 []\n\n"
+        "==== 输出格式 ====\n\n"
+        "JSON 对象，顶层字段如下：\n"
+        "{\n"
+        '  "executive_summary": {\n'
+        '    "recommendation": "建议升级",\n'
+        '    "theme": "安全加固与认证重构",\n'
+        '    "magnitude": "大",\n'
+        '    "reason": "包含多个安全修复和 OAuth 流程调整",\n'
+        '    "top_changes": [\n'
+        '      {"note_id": "R-001", "text": "Plugins/doctor: drop stale npm install records...", "risk": "high", "categories": ["breaking", "plugin"]}\n'
+        '    ],\n'
+        '    "one_liner": "本版包含 Feishu 认证流程 breaking change，需要重新配置后再升级。"\n'
+        '  },\n'
+        '  "developer_conclusion": "这是一版带兼容性包袱的更新，Feishu 认证从 QR 改为手动配置，Plugins/doctor 会清理 stale npm records。升级前先验证配置和插件兼容性。",\n'
+        '  "themes": [\n'
+        '    {\n'
+        '      "theme_id": "T-01",\n'
+        '      "theme_name": "Feishu 认证流程重构",\n'
+        '      "note_ids": ["R-002", "R-067", "R-385", "R-432"],\n'
+        '      "primary_category": "security",\n'
+        '      "risk_level": "high",\n'
+        '      "summary": "Feishu 默认认证路径从 QR 扫码改为手动 App ID 配置",\n'
+        '      "impact": "已绑定 Feishu 的用户需要重新走手动配置流程",\n'
+        '      "related_commits": ["abc1234"],\n'
+        '      "affected_files": ["src/channels/feishu/auth.ts"],\n'
+        '      "confidence": "high",\n'
+        '      "has_hidden_breaking": false,\n'
+        '      "hidden_risks": "",\n'
+        '      "reasoning": "commit abc1234 message \"feat(feishu): switch default auth to manual app id\" 直接对应"\n'
+        '    }\n'
+        '  ],\n'
+        '  "detailed_notes": [\n'
+        '    {\n'
+        '      "note_id": "R-001",\n'
+        '      "component": "Plugins/doctor",\n'
+        '      "categories": ["breaking", "plugin", "dependency"],\n'
+        '      "risk_level": "high",\n'
+        '      "interpretation": "doctor --fix 现在会删除 shadow bundled plugin 的 stale npm records。这意味着如果之前 doctor 修复过插件问题，升级后 registry 状态可能变化，需要验证插件是否正常加载。",\n'
+        '      "action_items": ["运行 openclaw doctor --fix 观察是否有插件被清理", "验证关键插件在升级后是否正常加载"],\n'
+        '      "audience": ["插件开发者", "运维人员"],\n'
+        '      "matched_commits": ["def5678"],\n'
+        '      "affected_files": ["src/plugins/doctor.ts"],\n'
+        '      "has_hidden_breaking": false,\n'
+        '      "reasoning": "commit def5678 message \"fix(doctor): drop stale managed npm install records\" 与 note 直接对应"\n'
+        '    }\n'
+        '  ],\n'
+        '  "compatibility_risks": [\n'
+        '    {"component": "Feishu", "description": "QR 扫码绑定失效，需要手动配置 App ID/App Secret。如果生产环境已绑定 Feishu，升级后 channel 会断连，需要提前准备手动配置流程。"}\n'
+        '  ],\n'
+        '  "test_points": [\n'
+        '    "用旧版 Feishu QR 配置验证升级后是否需要重新手动配置",\n'
+        '    "运行 openclaw doctor --fix 观察插件清理行为",\n'
+        '    "验证插件安装/卸载后 peer dependency 是否正确清理"\n'
+        '  ],\n'
+        '  "shadow_changes": [\n'
+        '    {"description": "commit ghi9012 新增了未在 release notes 中提及的 OAuth 回调接口", "evidence_commits": ["ghi9012"]}\n'
+        '  ],\n'
+        '  "progressive_fixes": [\n'
+        '    {\n'
+        '      "fix_id": "PF-01",\n'
+        '      "issue_description": "Feishu 认证在特定场景下 token 刷新失败",\n'
+        '      "stages": [\n'
+        '        {"note_id": "R-015", "source_version": "v2026.4.10", "fix_description": "增加 token 刷新重试次数", "completeness": "mitigation"},\n'
+        '        {"note_id": "R-042", "source_version": "v2026.4.11", "fix_description": "修复 refresh 逻辑中的竞态条件", "completeness": "partial"},\n'
+        '        {"note_id": "R-089", "source_version": "v2026.4.12", "fix_description": "重构 Feishu auth 模块，彻底消除 token 刷新问题", "completeness": "complete"}\n'
+        '      ],\n'
+        '      "final_status": "fully_fixed",\n'
+        '      "impact_assessment": "从 v2026.4.10 升级到 v2026.4.12 可完全解决该问题；若停留在中间版本，仍可能遇到偶发认证失败",\n'
+        '      "affected_components": ["Feishu", "Auth"]\n'
+        '    }\n'
+        '  ],\n'
+        '  "version_evolution": [\n'
+        '    {\n'
+        '      "evolution_id": "VE-01",\n'
+        '      "description": "Feishu 认证接口经历三次连续调整",\n'
+        '      "affected_versions": ["v2026.4.10", "v2026.4.11", "v2026.4.12"],\n'
+        '      "individual_risk": "low",\n'
+        '      "cumulative_risk": "high",\n'
+        '      "risk_escalation_reason": "v2026.4.10 废弃了旧 QR 绑定方式，v2026.4.11 修改了默认 auth 流程，v2026.4.12 完全移除 QR 支持。单个版本看都是渐进式调整，但跨越三个版本直接升级需要同时处理废弃通知、行为变化和接口移除三重影响，且没有中间版本的迁移缓冲",\n'
+        '      "related_themes": ["T-01"],\n'
+        '      "affected_components": ["Feishu", "Auth"],\n'
+        '      "migration_advice": "建议分步升级：先升级到 v2026.4.11 完成手动配置迁移，验证无误后再升级到 v2026.4.12。不要跨两个中间版本直接升级。"\n'
+        '    }\n'
+        '  ]\n'
+        "}\n\n"
+        "关键要求：\n"
+        "1) interpretation 必须有深度，回答\"改了什么\"\"有什么影响\"\"怎么办\"三个问题\n"
+        "2) 不要写模板化内容（如\"这项更新对 X 发出了兼容性信号\"）\n"
+        "3) 保守评估风险——不确定时取更高风险级别\n"
+        "4) reasoning 必须引用具体的 commit message 原文片段\n"
+        "5) 不要强行关联不相关的 commit\n"
+        "6) 不要编造不存在的变更\n"
+        "7) 主题名要简洁具体，不要用\"其他变更\"\"杂项\"\n"
+        "8) progressive_fixes 和 version_evolution 只在分析范围包含多个版本时输出；单版本分析输出空数组 []\n"
+        "9) risk_escalation_reason 必须具体，不能写\"多个变更叠加导致风险增加\"这种空话"
+    )
 # ---------------------------------------------------------------------------
 # File I/O
 # ---------------------------------------------------------------------------
@@ -590,6 +479,7 @@ def write_base_analysis(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = [
         {
+            "note_id": a.note_id,
             "release_tag": a.release_tag,
             "raw_text": a.raw_text,
             "primary_category": a.primary_category,
@@ -615,6 +505,7 @@ def read_base_analysis(path: Path) -> List[ChangeAnalysis]:
     analyses: List[ChangeAnalysis] = []
     for item in payload:
         analyses.append(ChangeAnalysis(
+            note_id=item.get("note_id", ""),
             release_tag=item.get("release_tag", ""),
             raw_text=item.get("raw_text", ""),
             primary_category=item.get("primary_category", "other"),
@@ -1377,16 +1268,15 @@ def split_analysis_data_into_chunks(
 
 def _chunk_instructions(chunk_index: int, total_chunks: int, lang: str) -> str:
     """Append chunk-specific instructions for the LLM."""
-    if lang == "zh":
-        return (
-            f"\n\n==== 分片分析说明 ====\n"
-            f"这是第 {chunk_index + 1}/{total_chunks} 个分析分片。\n"
-            f"你的任务是分析本分片中的 release notes 和 commits，输出与本分片相关的 themes 和 detailed_notes。\n"
-            f"不需要输出 executive_summary、developer_conclusion、compatibility_risks、test_points、shadow_changes —— "
-            f"这些将在所有分片分析完成后由合并步骤统一生成。\n"
-            f"如果某个 theme 的 note 分布在多个分片中，每个分片只输出自己拥有的那部分 notes；"
-            f"合并步骤会自动整合。\n"
-        )
+    return (
+        f"\n\n==== 分片分析说明 ====\n"
+        f"这是第 {chunk_index + 1}/{total_chunks} 个分析分片。\n"
+        f"你的任务是分析本分片中的 release notes 和 commits，输出与本分片相关的 themes 和 detailed_notes。\n"
+        f"不需要输出 executive_summary、developer_conclusion、compatibility_risks、test_points、shadow_changes —— "
+        f"这些将在所有分片分析完成后由合并步骤统一生成。\n"
+        f"如果某个 theme 的 note 分布在多个分片中，每个分片只输出自己拥有的那部分 notes；"
+        f"合并步骤会自动整合。\n"
+    )
     return (
         f"\n\n==== Chunk Analysis Instructions ====\n"
         f"This is chunk {chunk_index + 1} of {total_chunks}.\n"
@@ -1475,87 +1365,45 @@ def _generate_enhancement_prompt(
                 f"- {nid} [{dn.get('component', '')}]: {interp[:120]}{'...' if len(interp) > 120 else ''}"
             )
 
-    if lang == "zh":
-        prompt = (
-            "==== 合并后增强任务 ====\n\n"
-            f"以下是从 {len(themes_map)} 个 themes 和 {len(detailed_map)} 条详细分析中合并得到的结果。"
-            f"合并步骤（纯 Python，无 LLM）已经生成了初步结果，但以下字段需要增强：\n"
-            f"需要增强的字段: {', '.join(needs) if needs else 'executive_summary, developer_conclusion, compatibility_risks, test_points'}\n\n"
-            "=== Themes 摘要 ===\n"
-            + "\n".join(theme_lines)
-            + "\n\n=== 高风险 Themes 详情 ===\n"
-            + ("\n".join(hr_lines) if hr_lines else "(无)")
-            + "\n\n=== 高风险 Detailed Notes 摘要 ===\n"
-            + ("\n".join(dn_lines) if dn_lines else "(无)")
-            + "\n\n=== 任务 ===\n"
-            "请基于以上 themes 和 notes 的摘要信息，生成以下增强内容（JSON 格式）：\n\n"
-            "{\n"
-            '  "executive_summary": {\n'
-            '    "recommendation": "建议升级/谨慎升级/暂缓升级",\n'
-            '    "theme": "15字以内的核心主题，要具体不要泛化",\n'
-            '    "magnitude": "大/中/小",\n'
-            '    "reason": "50字以内的建议理由",\n'
-            '    "top_changes": [\n'
-            '      {"note_id": "R-xxx", "text": "变化摘要", "risk": "high/medium/low", "categories": ["breaking", "security"]}\n'
-            '    ],\n'
-            '    "one_liner": "一句话判断"\n'
-            '  },\n'
-            '  "developer_conclusion": "面向 Channel/插件开发者的一句话结论（50字以内），要具体",\n'
-            '  "compatibility_risks": [\n'
-            '    {"component": "组件名", "description": "具体的兼容性风险描述"}\n'
-            '  ],\n'
-            '  "test_points": [\n'
-            '    "具体的可操作的测试建议"\n'
-            '  ]\n'
-            "}\n\n"
-            "要求：\n"
-            "1. theme 必须具体，不能是\"多个主题变更\"这种泛化描述\n"
-            "2. developer_conclusion 必须具体，例如\"Feishu 认证从 QR 改为手动配置，需要重新绑定\"\n"
-            "3. compatibility_risks 每条必须说明\"什么会 break、为什么、怎么验证\"\n"
-            "4. test_points 每条必须是可操作的验证步骤\n"
-            "5. 只输出 JSON，不要 markdown 代码块包裹"
-        )
-    else:
-        prompt = (
-            "==== Post-Merge Enhancement Task ====\n\n"
-            f"Below are {len(themes_map)} themes and {len(detailed_map)} detailed notes merged from chunk results. "
-            f"The merge step (pure Python, no LLM) produced preliminary results, but the following fields need enhancement:\n"
-            f"Fields needing enhancement: {', '.join(needs) if needs else 'executive_summary, developer_conclusion, compatibility_risks, test_points'}\n\n"
-            "=== Theme Summaries ===\n"
-            + "\n".join(theme_lines)
-            + "\n\n=== High-Risk Theme Details ===\n"
-            + ("\n".join(hr_lines) if hr_lines else "(none)")
-            + "\n\n=== High-Risk Detailed Note Summaries ===\n"
-            + ("\n".join(dn_lines) if dn_lines else "(none)")
-            + "\n\n=== Task ===\n"
-            "Please generate the following enhanced content based on the theme and note summaries above (JSON format):\n\n"
-            "{\n"
-            '  "executive_summary": {\n'
-            '    "recommendation": "Recommend Upgrade / Upgrade with Caution / Defer",\n'
-            '    "theme": "Core theme within 15 words, be specific not generic",\n'
-            '    "magnitude": "Large / Medium / Small",\n'
-            '    "reason": "Rationale within 50 words",\n'
-            '    "top_changes": [\n'
-            '      {"note_id": "R-xxx", "text": "Change summary", "risk": "high/medium/low", "categories": ["breaking", "security"]}\n'
-            '    ],\n'
-            '    "one_liner": "One-sentence judgment"\n'
-            '  },\n'
-            '  "developer_conclusion": "One-sentence conclusion for channel/plugin developers (within 50 words), be specific",\n'
-            '  "compatibility_risks": [\n'
-            '    {"component": "Component name", "description": "Specific compatibility risk description"}\n'
-            '  ],\n'
-            '  "test_points": [\n'
-            '    "Specific actionable test recommendation"\n'
-            '  ]\n'
-            "}\n\n"
-            "Requirements:\n"
-            '1. theme must be specific, not generic like "multiple theme changes"\n'
-            "2. developer_conclusion must be specific\n"
-            '3. compatibility_risks must explain "WHAT will break, WHY, and HOW to verify"\n'
-            "4. test_points must be actionable verification steps\n"
-            "5. Output JSON only, no markdown code block wrapper"
-        )
-
+    prompt = (
+        "==== 合并后增强任务 ====\n\n"
+        f"以下是从 {len(themes_map)} 个 themes 和 {len(detailed_map)} 条详细分析中合并得到的结果。"
+        f"合并步骤（纯 Python，无 LLM）已经生成了初步结果，但以下字段需要增强：\n"
+        f"需要增强的字段: {', '.join(needs) if needs else 'executive_summary, developer_conclusion, compatibility_risks, test_points'}\n\n"
+        "=== Themes 摘要 ===\n"
+        + "\n".join(theme_lines)
+        + "\n\n=== 高风险 Themes 详情 ===\n"
+        + ("\n".join(hr_lines) if hr_lines else "(无)")
+        + "\n\n=== 高风险 Detailed Notes 摘要 ===\n"
+        + ("\n".join(dn_lines) if dn_lines else "(无)")
+        + "\n\n=== 任务 ===\n"
+        "请基于以上 themes 和 notes 的摘要信息，生成以下增强内容（JSON 格式）：\n\n"
+        "{\n"
+        '  "executive_summary": {\n'
+        '    "recommendation": "建议升级/谨慎升级/暂缓升级",\n'
+        '    "theme": "15字以内的核心主题，要具体不要泛化",\n'
+        '    "magnitude": "大/中/小",\n'
+        '    "reason": "50字以内的建议理由",\n'
+        '    "top_changes": [\n'
+        '      {"note_id": "R-xxx", "text": "变化摘要", "risk": "high/medium/low", "categories": ["breaking", "security"]}\n'
+        '    ],\n'
+        '    "one_liner": "一句话判断"\n'
+        '  },\n'
+        '  "developer_conclusion": "面向 Channel/插件开发者的一句话结论（50字以内），要具体",\n'
+        '  "compatibility_risks": [\n'
+        '    {"component": "组件名", "description": "具体的兼容性风险描述"}\n'
+        '  ],\n'
+        '  "test_points": [\n'
+        '    "具体的可操作的测试建议"\n'
+        '  ]\n'
+        "}\n\n"
+        "要求：\n"
+        "1. theme 必须具体，不能是\"多个主题变更\"这种泛化描述\n"
+        "2. developer_conclusion 必须具体，例如\"Feishu 认证从 QR 改为手动配置，需要重新绑定\"\n"
+        "3. compatibility_risks 每条必须说明\"什么会 break、为什么、怎么验证\"\n"
+        "4. test_points 每条必须是可操作的验证步骤\n"
+        "5. 只输出 JSON，不要 markdown 代码块包裹"
+    )
     return prompt
 
 
@@ -1815,6 +1663,274 @@ def merge_chunk_results(
         }
 
     return {"enhancement_needed": False, "needs_fields": []}
+
+
+# ---------------------------------------------------------------------------
+# Recursive merge aggregation: data compression and merge prompts
+# ---------------------------------------------------------------------------
+
+def compress_for_merge(report: LLMFullReport) -> Dict[str, Any]:
+    """Compress a full LLM analysis report for merge-layer input.
+
+    Tiered compression preserves information needed for cross-group
+    association while staying within token budgets:
+    - high risk notes: keep complete (may need re-evaluation across groups)
+    - medium risk: keep core fields (drop action_items, audience)
+    - low risk: minimal (component + categories + risk + brief interpretation)
+    - themes / progressive_fixes / version_evolution: keep complete
+    - executive_summary / developer_conclusion: discard (root regenerates)
+    """
+    # Compress detailed_notes by risk level
+    compressed_notes: List[Dict[str, Any]] = []
+    for dn in report.detailed_notes:
+        risk = dn.risk_level.lower()
+        base = {
+            "note_id": dn.note_id,
+            "component": dn.component,
+            "categories": dn.categories,
+            "risk_level": risk,
+        }
+        if risk == "high":
+            compressed_notes.append({
+                **base,
+                "interpretation": dn.interpretation,
+                "action_items": dn.action_items,
+                "audience": dn.audience,
+                "matched_commits": dn.matched_commits,
+                "affected_files": dn.affected_files,
+                "has_hidden_breaking": dn.has_hidden_breaking,
+                "reasoning": dn.reasoning,
+            })
+        elif risk == "medium":
+            compressed_notes.append({
+                **base,
+                "interpretation": dn.interpretation,
+                "matched_commits": dn.matched_commits,
+                "affected_files": dn.affected_files,
+                "reasoning": dn.reasoning,
+            })
+        else:
+            # low: minimal
+            interp = dn.interpretation
+            if len(interp) > 100:
+                interp = interp[:100] + "..."
+            compressed_notes.append({
+                **base,
+                "interpretation": interp,
+                "matched_commits": dn.matched_commits,
+            })
+
+    # Themes: keep complete
+    themes_out = []
+    for t in report.themes:
+        themes_out.append({
+            "theme_id": t.theme_id,
+            "theme_name": t.theme_name,
+            "note_ids": t.note_ids,
+            "raw_texts": t.raw_texts,
+            "primary_category": t.primary_category,
+            "risk_level": t.risk_level,
+            "summary": t.summary,
+            "impact": t.impact,
+            "related_commits": t.related_commits,
+            "affected_files": t.affected_files,
+            "confidence": t.confidence,
+            "has_hidden_breaking": t.has_hidden_breaking,
+            "hidden_risks": t.hidden_risks,
+            "reasoning": t.reasoning,
+        })
+
+    # Progressive fixes: keep complete (core cross-version data)
+    pf_out = []
+    for pf in report.progressive_fixes:
+        pf_out.append({
+            "fix_id": pf.fix_id,
+            "issue_description": pf.issue_description,
+            "stages": pf.stages,
+            "final_status": pf.final_status,
+            "impact_assessment": pf.impact_assessment,
+            "affected_components": pf.affected_components,
+        })
+
+    # Version evolution: keep complete
+    ve_out = []
+    for ve in report.version_evolution:
+        ve_out.append({
+            "evolution_id": ve.evolution_id,
+            "description": ve.description,
+            "affected_versions": ve.affected_versions,
+            "individual_risk": ve.individual_risk,
+            "cumulative_risk": ve.cumulative_risk,
+            "risk_escalation_reason": ve.risk_escalation_reason,
+            "related_themes": ve.related_themes,
+            "affected_components": ve.affected_components,
+            "migration_advice": ve.migration_advice,
+        })
+
+    # Compatibility risks: keep complete
+    cr_out = []
+    for cr in report.compatibility_risks:
+        cr_out.append({
+            "component": cr.component,
+            "description": cr.description,
+        })
+
+    return {
+        "themes": themes_out,
+        "detailed_notes": compressed_notes,
+        "progressive_fixes": pf_out,
+        "version_evolution": ve_out,
+        "compatibility_risks": cr_out,
+        "shadow_changes": report.shadow_changes,
+        "test_points": report.test_points,
+    }
+
+
+def build_merge_prompt(group_a: Dict[str, Any], group_b: Dict[str, Any], lang: str = "zh") -> str:
+    """Build a merge-layer prompt for the LLM to combine two analysis results.
+
+    The LLM receives two compressed sub-group results and performs semantic
+    merge operations: theme deduplication, progressive fix chain linking,
+    cumulative risk assessment, and risk re-evaluation.
+    """
+    a_json = json.dumps(group_a, ensure_ascii=False, indent=2)
+    b_json = json.dumps(group_b, ensure_ascii=False, indent=2)
+
+    return (
+        "# OpenClaw Release Analyzer - 跨版本组合并分析\n\n"
+        "你正在合并两个相邻版本组的分析结果。这不是从头分析，"
+        "而是基于已有的结构化分析结果进行整合、去重和跨组关联发现。\n\n"
+        "## 版本组 A\n"
+        "```json\n"
+        f"{a_json}\n"
+        "```\n\n"
+        "## 版本组 B\n"
+        "```json\n"
+        f"{b_json}\n"
+        "```\n\n"
+        "## 合并任务\n\n"
+        "### 1. 主题合并与去重\n"
+        "- 对比 A 和 B 的 themes\n"
+        "- 如果两个 themes 描述的是同一组件/功能的同一类变更，合并为一个 theme\n"
+        "- 合并后：note_ids 取并集、related_commits 取并集、affected_files 取并集\n"
+        "- 如果风险级别不同，取更高的级别\n"
+        "- 保留未合并的独立 themes\n\n"
+        "### 2. 渐进式修复链连接（核心任务）\n"
+        "- 检查 A 的 progressive_fixes 中 final_status 不是 'fully_fixed' 的条目\n"
+        "- 检查 B 中是否有继续修复同一问题的 notes/themes\n"
+        "- 如果找到匹配，将两条链连接为一条更长的链\n"
+        "- 更新 final_status、stages（按 source_version 排序）、affected_versions\n"
+        "- 如果 A 和 B 各自有独立的修复链，全部保留\n\n"
+        "### 3. 累积风险评估（VersionEvolution）\n"
+        "- 检查跨越 A 和 B 的同一组件的多个变更\n"
+        "- 判断：单独看 A 和 B 各自风险低，但合并后是否风险累积\n"
+        "- 典型模式：\n"
+        "  - 模式A：v1 废弃接口 → v2 修改默认行为 → v3 移除兼容层\n"
+        "  - 模式B：同一组件在多版本中持续调整，每次独立但组合后影响大\n"
+        "  - 模式C：配置变更在多个版本中分步实施，跨越升级需要多次迁移\n"
+        "- 创建 VersionEvolution 条目，risk_escalation_reason 必须具体说明\n"
+        "  为什么'跨组升级'比'逐组升级'更危险\n\n"
+        "### 4. Note 风险重评估\n"
+        "- 检查所有 high risk notes，确认跨组视角下是否仍然是 high\n"
+        "- 检查是否有 medium/low risk notes 在跨组关联后应升级为 high\n\n"
+        "### 5. 兼容性风险与 Shadow Changes 合并\n"
+        "- 合并 compatibility_risks，按 component 去重\n"
+        "- 合并 shadow_changes，按 description 去重\n"
+        "- 合并 test_points，去重\n\n"
+        "## 输出格式\n\n"
+        "输出 JSON，顶层字段如下：\n"
+        "{\n"
+        '  "executive_summary": {\n'
+        '    "recommendation": "建议升级/谨慎升级/暂缓升级",\n'
+        '    "theme": "核心主题",\n'
+        '    "magnitude": "大/中/小",\n'
+        '    "reason": "建议理由",\n'
+        '    "top_changes": [...],\n'
+        '    "one_liner": "一句话判断"\n'
+        '  },\n'
+        '  "developer_conclusion": "面向开发者的一句话结论",\n'
+        '  "themes": [...],          // 合并后的 themes（完整格式）\n'
+        '  "detailed_notes": [...],  // 合并后的 notes（high 完整，medium 核心，low 极简）\n'
+        '  "compatibility_risks": [...],\n'
+        '  "test_points": [...],\n'
+        '  "shadow_changes": [...],\n'
+        '  "progressive_fixes": [...],   // 连接后的修复链（完整）\n'
+        '  "version_evolution": [...]    // 累积风险评估（完整）\n'
+        "}\n\n"
+        "关键要求：\n"
+        "1) 不要丢失任何 high risk note 的信息\n"
+        "2) 保留所有 progressive_fixes 的完整 stages（包括所有 note_id 和 source_version）\n"
+        "3) VersionEvolution 的 risk_escalation_reason 必须具体，不能写空话\n"
+        "4) 不要编造不存在的关联\n"
+        "5) 主题合并时，如果两个 theme 的 note_ids 有重叠但描述不同，不要强行合并\n"
+        "6) 如果是根节点合并（只剩两个组），executive_summary 和 developer_conclusion 必须完整生成\n"
+        "7) 只输出 JSON，不要 markdown 代码块包裹"
+    )
+def parse_merge_results(response_text: str) -> LLMFullReport:
+    """Parse LLM merge-layer response into LLMFullReport.
+
+    Same format as parse_llm_results. May include executive_summary
+    and developer_conclusion when the merge is at the root level.
+    """
+    text = re.sub(r"^```json\s*", "", response_text)
+    text = re.sub(r"\s*```\s*$", "", text)
+    payload = json.loads(text)
+
+    report = LLMFullReport()
+
+    if not isinstance(payload, dict):
+        return report
+
+    # Parse executive summary (may be present at root merge)
+    es = payload.get("executive_summary", {})
+    if isinstance(es, dict):
+        report.executive_summary = _parse_executive_summary(es)
+
+    # Parse developer conclusion
+    report.developer_conclusion = payload.get("developer_conclusion", "")
+
+    # Parse themes
+    for t in payload.get("themes", []):
+        if isinstance(t, dict):
+            theme = _parse_theme(t)
+            if theme:
+                report.themes.append(theme)
+
+    # Parse detailed notes
+    for dn in payload.get("detailed_notes", []):
+        if isinstance(dn, dict):
+            note = _parse_detailed_note(dn)
+            if note:
+                report.detailed_notes.append(note)
+
+    # Parse compatibility risks
+    for cr in payload.get("compatibility_risks", []):
+        if isinstance(cr, dict):
+            risk = _parse_compatibility_risk(cr)
+            if risk:
+                report.compatibility_risks.append(risk)
+
+    # Parse test points
+    report.test_points = [str(tp) for tp in payload.get("test_points", []) if tp]
+
+    # Parse shadow changes
+    report.shadow_changes = [sc for sc in payload.get("shadow_changes", []) if isinstance(sc, dict)]
+
+    # Parse progressive fixes
+    for pf in payload.get("progressive_fixes", []):
+        if isinstance(pf, dict):
+            fix = _parse_progressive_fix(pf)
+            if fix:
+                report.progressive_fixes.append(fix)
+
+    # Parse version evolution
+    for ve in payload.get("version_evolution", []):
+        if isinstance(ve, dict):
+            evo = _parse_version_evolution(ve)
+            if evo:
+                report.version_evolution.append(evo)
+
+    return report
 
 
 def discover_chunk_results(snapshot_dir: Path, repo: str, target_tag: str) -> List[Path]:

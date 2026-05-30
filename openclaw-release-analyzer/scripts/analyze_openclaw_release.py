@@ -36,19 +36,27 @@ from config import (
     default_cache_dir,
     LLM_RESULTS_TTL_DAYS,
     RELEASE_NOTES_MAX_VERSIONS,
+    RECURSIVE_MERGE_ENABLED,
+    RECURSIVE_MERGE_MAX_TOKENS_PER_LEAF,
+    RECURSIVE_MERGE_MAX_VERSIONS_PER_LEAF,
+    RECURSIVE_MERGE_MAX_DEPTH,
+    RECURSIVE_MERGE_MIN_VERSIONS,
 )
-from i18n import T, _en, _zh, detect_language
+from i18n import T, _zh
 from models import ChangeAnalysis, CommitInfo, Release, Theme, LLMFullReport, normalize_version, version_key
 from prompts import (
     analysis_data_path,
     base_analysis_path,
     build_analysis_data,
+    build_merge_prompt,
+    compress_for_merge,
     confidence_for,
     discover_chunk_results,
     enhance_analyses_with_llm,
     llm_results_path,
     merge_chunk_results,
     parse_llm_results,
+    parse_merge_results,
     read_base_analysis,
     select_relevant_commits,
     should_use_llm_enhancement,
@@ -688,12 +696,21 @@ def classify_release(release: Release) -> Dict[str, List[str]]:
     ]}
     section: Optional[str] = None
     lines = release.body.splitlines()
+    skip_section = False
 
     for line in lines:
         # P1-3: Try to detect section from Markdown headings (including emoji headings)
         inferred = current_section(line)
         if inferred:
             section = inferred
+            skip_section = False
+            continue
+
+        # Skip metadata sections (Release verification, artifacts, etc.)
+        if _is_skip_section_heading(line):
+            skip_section = True
+            continue
+        if skip_section:
             continue
 
         stripped = line.strip()
@@ -762,13 +779,46 @@ def classify_release(release: Release) -> Dict[str, List[str]]:
     return categories
 
 
+# Sections that contain metadata (URLs, verification links, etc.) rather than
+# actual changelog entries. Items under these sections are skipped.
+_SKIP_SECTION_HEADINGS = frozenset({
+    "release verification", "verification", "verify", "checksums",
+    "signatures", "artifacts", "downloads", "links", "metadata",
+    "release notes source", "references", "credits", "acknowledgments",
+})
+
+
+def _is_skip_section_heading(line: str) -> bool:
+    """Return True if the line is a Markdown heading for a metadata section."""
+    m = re.match(r"^#{1,3}\s*(.+)$", line.strip())
+    if not m:
+        return False
+    heading = m.group(1).lower().strip()
+    # Strip trailing colon or punctuation
+    heading = re.sub(r"[:：]\s*$", "", heading)
+    return heading in _SKIP_SECTION_HEADINGS
+
+
 def release_note_items(release: Release) -> List[str]:
     items: List[str] = []
     lines = release.body.splitlines()
+    skip_section = False
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
+
+        # Detect section headings; skip items under metadata sections
+        if _is_skip_section_heading(stripped):
+            skip_section = True
+            continue
+        # Any heading resets skip (except sub-headings within skip sections)
+        if re.match(r"^#{1,3}\s+", stripped):
+            skip_section = False
+            continue
+        if skip_section:
+            continue
+
         commit_match = CONVENTIONAL_COMMIT_RE.match(stripped)
         if commit_match:
             item = commit_match.group(4).strip()
@@ -1143,105 +1193,86 @@ def priority_score(categories: Sequence[str], risk: str) -> int:
 
 
 def audience_for(categories: Sequence[str], component: str, lang: str) -> List[str]:
-    zh = lang == "zh"
     labels = {
-        "plugin": "插件开发者" if zh else "plugin developers",
-        "api_sdk": "API/SDK 使用者" if zh else "API/SDK users",
-        "cli": "CLI 使用者和自动化脚本维护者" if zh else "CLI users and automation maintainers",
-        "config": "配置维护者和自部署用户" if zh else "configuration owners and self-hosted users",
-        "dependency": "CI/CD、部署和运行时维护者" if zh else "CI/CD, deployment, and runtime owners",
-        "security": "安全敏感用户" if zh else "security-sensitive users",
-        "performance": "稳定性敏感用户" if zh else "stability-sensitive users",
-        "fix": "受相关问题影响的用户" if zh else "users affected by the fixed issue",
-        "feature": "需要相关新能力的用户" if zh else "users who need the new capability",
+        "plugin": "插件开发者",
+        "api_sdk": "API/SDK 使用者",
+        "cli": "CLI 使用者和自动化脚本维护者",
+        "config": "配置维护者和自部署用户",
+        "dependency": "CI/CD、部署和运行时维护者",
+        "security": "安全敏感用户",
+        "performance": "稳定性敏感用户",
+        "fix": "受相关问题影响的用户",
+        "feature": "需要相关新能力的用户",
     }
     audience: List[str] = []
     for cat in ["plugin", "api_sdk", "cli", "config", "dependency", "security", "performance", "fix", "feature"]:
         if cat in categories and labels[cat] not in audience:
             audience.append(labels[cat])
     if not audience:
-        audience.append("普通 OpenClaw 用户" if zh else "general OpenClaw users")
+        audience.append("普通 OpenClaw 用户")
     if component not in ["General", "Security"]:
-        audience.append((f"使用 {component} 相关能力的团队" if zh else f"teams using {component}-related functionality"))
+        audience.append(f"使用 {component} 相关能力的团队")
     return audience[:3]
 
 
 def interpret_change(item: str, categories: Sequence[str], component: str, lang: str) -> str:
     clean = item.rstrip(".")
     lowered = clean.lower()
-    if lang == "zh":
-        if "security" in categories:
-            if any(token in lowered for token in ["cve", "vulnerability", "security fix", "auth", "authentication", "permission", "credential", "token"]):
-                return f"这项更新与 {component} 的安全面有关，优先判断你当前版本是否落在受影响范围，以及认证、授权或凭据链路是否会因此变化。若命中生产路径，建议提前验证修复后的访问控制和失败处理。"
-            return f"这项更新收紧或调整了 {component} 的安全相关行为。它不一定会直接改变功能结果，但可能影响认证流程、权限边界或默认安全策略，升级前最好核对现网配置是否仍然成立。"
-        if "breaking" in categories or "migration" in categories:
-            return f"这项更新对 {component} 发出了兼容性或迁移信号。更值得关注的是现有接口、配置、脚本和自动化流程会不会失配；如果依赖旧行为，应该先补齐迁移核对和回归验证，再安排正式升级。"
-        if "dependency" in categories:
-            return f"这项更新更像是在改动 {component} 的环境前提，而不是单纯新增功能。需要先确认 Node.js、包管理器、锁文件、构建镜像和 CI/CD 运行时是否满足新的依赖要求，否则升级可能卡在安装、构建或启动阶段。"
-        if "fix" in categories and any(token in lowered for token in ["stop rejecting", "allow", "validation", "validate", "rejecting"]):
-            return f"这项更新是在修正 {component} 的校验或兼容性问题，重点价值是减少误报、误拒绝或本不该失败的场景。若你的团队之前绕过过类似限制，升级后应回归验证原先失败的链路是否已经恢复正常。"
-        if "plugin" in categories:
-            return f"这项更新会影响 {component} 的插件扩展面。即使不是破坏性变更，也可能波及插件清单、hook、加载顺序或扩展契约；对自定义插件较多的团队，建议把兼容性回归放进升级前检查。"
-        if "api_sdk" in categories:
-            return f"这项更新直接作用在 {component} 的 API/SDK 表面，调用方式、导出内容、类型定义或封装层都可能受影响。若你们有二次封装或对外集成，升级前最好先核对关键调用路径。"
-        if "cli" in categories:
-            return f"这项更新主要影响 {component} 的命令行使用方式。需要留意命令参数、子命令、输出格式或退出码是否变化，因为这些细节最容易连带影响自动化脚本和运维流程。"
-        if "config" in categories:
-            return f"这项更新集中在 {component} 的配置层，通常会影响 schema、默认值、必填项或环境变量约定。真正的风险不在文案本身，而在于旧配置是否还能被接受、以及部署参数是否需要同步调整。"
-        if "performance" in categories:
-            return f"这项更新偏向 {component} 的性能或稳定性改善，通常属于正向收益。对高负载、长连接或关键路径敏感的场景，仍建议用现网相近流量做一次回归确认，避免收益伴随行为变化。"
-        if "fix" in categories:
-            return f"这项更新是在修复 {component} 的具体问题。是否值得优先升级，主要取决于你当前是否正被同类缺陷影响；如果问题已命中生产或核心流程，这类版本通常有较高升级价值。"
-        if "feature" in categories:
-            return f"这项更新为 {component} 增加了新能力或增强了现有能力，更偏向可选收益而不是刚性升级项。如果你正好需要这部分能力，可以评估尽快跟进；否则可放到常规升级窗口处理。"
-        if "docs" in categories:
-            return f"这项更新主要是补充或修正文档，对运行时风险通常较小。但如果它解释的是新配置、迁移步骤或使用约束，仍值得核对你们当前实践是否与官方说明一致。"
-        if "known_issue" in categories:
-            return f"这条说明更像是在提示 {component} 仍有已知限制或待解决问题。它未必阻止升级，但会影响你对版本稳定性的预期，适合提前确认是否命中自身场景并准备规避方案。"
-        return f"这项更新来自 {component}，但 release note 提供的信息有限。仅凭这条描述还不足以判断升级价值，最好结合关联 PR、Issue 或实际改动范围再决定是否优先跟进。"
-    if "breaking" in categories or "migration" in categories:
-        return f"This change carries compatibility or migration signals for {component}. Verify existing usage, configuration, and automation before upgrading. Key note: {clean}."
-    if "dependency" in categories:
-        return f"This affects dependency or runtime requirements for {component}. Check installation, CI/CD, images, or production runtime compatibility. Key note: {clean}."
     if "security" in categories:
-        return f"This is related to security, authentication, permissions, credentials, or sandbox boundaries. Confirm whether your deployment is affected. Key note: {clean}."
-    if any(cat in categories for cat in ["plugin", "api_sdk", "cli", "config"]):
-        return f"This affects developer-visible surface area for {component}, such as plugins, API/SDK, CLI, or configuration. Validate compatibility and docs. Key note: {clean}."
+        if any(token in lowered for token in ["cve", "vulnerability", "security fix", "auth", "authentication", "permission", "credential", "token"]):
+            return f"这项更新与 {component} 的安全面有关，优先判断你当前版本是否落在受影响范围，以及认证、授权或凭据链路是否会因此变化。若命中生产路径，建议提前验证修复后的访问控制和失败处理。"
+        return f"这项更新收紧或调整了 {component} 的安全相关行为。它不一定会直接改变功能结果，但可能影响认证流程、权限边界或默认安全策略，升级前最好核对现网配置是否仍然成立。"
+    if "breaking" in categories or "migration" in categories:
+        return f"这项更新对 {component} 发出了兼容性或迁移信号。更值得关注的是现有接口、配置、脚本和自动化流程会不会失配；如果依赖旧行为，应该先补齐迁移核对和回归验证，再安排正式升级。"
+    if "dependency" in categories:
+        return f"这项更新更像是在改动 {component} 的环境前提，而不是单纯新增功能。需要先确认 Node.js、包管理器、锁文件、构建镜像和 CI/CD 运行时是否满足新的依赖要求，否则升级可能卡在安装、构建或启动阶段。"
+    if "fix" in categories and any(token in lowered for token in ["stop rejecting", "allow", "validation", "validate", "rejecting"]):
+        return f"这项更新是在修正 {component} 的校验或兼容性问题，重点价值是减少误报、误拒绝或本不该失败的场景。若你的团队之前绕过过类似限制，升级后应回归验证原先失败的链路是否已经恢复正常。"
+    if "plugin" in categories:
+        return f"这项更新会影响 {component} 的插件扩展面。即使不是破坏性变更，也可能波及插件清单、hook、加载顺序或扩展契约；对自定义插件较多的团队，建议把兼容性回归放进升级前检查。"
+    if "api_sdk" in categories:
+        return f"这项更新直接作用在 {component} 的 API/SDK 表面，调用方式、导出内容、类型定义或封装层都可能受影响。若你们有二次封装或对外集成，升级前最好先核对关键调用路径。"
+    if "cli" in categories:
+        return f"这项更新主要影响 {component} 的命令行使用方式。需要留意命令参数、子命令、输出格式或退出码是否变化，因为这些细节最容易连带影响自动化脚本和运维流程。"
+    if "config" in categories:
+        return f"这项更新集中在 {component} 的配置层，通常会影响 schema、默认值、必填项或环境变量约定。真正的风险不在文案本身，而在于旧配置是否还能被接受、以及部署参数是否需要同步调整。"
     if "performance" in categories:
-        return f"This points to a performance or stability improvement in {component}. Validate in critical or high-load workflows. Key note: {clean}."
+        return f"这项更新偏向 {component} 的性能或稳定性改善，通常属于正向收益。对高负载、长连接或关键路径敏感的场景，仍建议用现网相近流量做一次回归确认，避免收益伴随行为变化。"
     if "fix" in categories:
-        return f"This fixes a {component}-related issue. Prioritize it if you are affected by the same workflow. Key note: {clean}."
+        return f"这项更新是在修复 {component} 的具体问题。是否值得优先升级，主要取决于你当前是否正被同类缺陷影响；如果问题已命中生产或核心流程，这类版本通常有较高升级价值。"
     if "feature" in categories:
-        return f"This adds or improves {component}-related capability. Upgrade priority depends on whether you need it. Key note: {clean}."
-    return f"This is a general {component} update. The release note lacks enough context for deeper impact assessment; inspect the linked PR/issue if needed. Key note: {clean}."
-
+        return f"这项更新为 {component} 增加了新能力或增强了现有能力，更偏向可选收益而不是刚性升级项。如果你正好需要这部分能力，可以评估尽快跟进；否则可放到常规升级窗口处理。"
+    if "docs" in categories:
+        return f"这项更新主要是补充或修正文档，对运行时风险通常较小。但如果它解释的是新配置、迁移步骤或使用约束，仍值得核对你们当前实践是否与官方说明一致。"
+    if "known_issue" in categories:
+        return f"这条说明更像是在提示 {component} 仍有已知限制或待解决问题。它未必阻止升级，但会影响你对版本稳定性的预期，适合提前确认是否命中自身场景并准备规避方案。"
+    return f"这项更新来自 {component}，但 release note 提供的信息有限。仅凭这条描述还不足以判断升级价值，最好结合关联 PR、Issue 或实际改动范围再决定是否优先跟进。"
 
 def actions_for(categories: Sequence[str], risk: str, component: str, lang: str) -> List[str]:
-    zh = lang == "zh"
     actions: List[str] = []
     if any(cat in categories for cat in ["breaking", "migration"]):
-        actions.append("先核对迁移说明、废弃项和重命名项，再安排升级验证。" if zh else "Check migration notes, deprecations, and renamed/removed items before validation.")
-        actions.append("对依赖旧接口、旧配置或旧脚本的流程做定向回归。" if zh else "Run targeted regression for flows that rely on old interfaces, config, or scripts.")
+        actions.append("先核对迁移说明、废弃项和重命名项，再安排升级验证。")
+        actions.append("对依赖旧接口、旧配置或旧脚本的流程做定向回归。")
     if "dependency" in categories:
-        actions.append("检查 Node.js、包管理器、锁文件、构建镜像和 CI/CD 运行时版本。" if zh else "Check Node.js, package manager, lockfile, build image, and CI/CD runtime versions.")
+        actions.append("检查 Node.js、包管理器、锁文件、构建镜像和 CI/CD 运行时版本。")
     if "plugin" in categories:
-        actions.append("验证插件 manifest、hook 签名、加载顺序和扩展契约。" if zh else "Validate plugin manifests, hook signatures, loading order, and extension contracts.")
+        actions.append("验证插件 manifest、hook 签名、加载顺序和扩展契约。")
     if "api_sdk" in categories:
-        actions.append("检查 API/SDK 导出、类型定义、封装层和弃用提示。" if zh else "Review API/SDK exports, types, wrappers, and deprecation notices.")
+        actions.append("检查 API/SDK 导出、类型定义、封装层和弃用提示。")
     if "cli" in categories:
-        actions.append("回归测试依赖 CLI 参数、子命令、输出格式或退出码的脚本。" if zh else "Regression-test scripts that depend on CLI flags, subcommands, output, or exit codes.")
+        actions.append("回归测试依赖 CLI 参数、子命令、输出格式或退出码的脚本。")
     if "config" in categories:
-        actions.append("逐项比对配置 schema、默认值、必填项和环境变量约定。" if zh else "Review config schema, defaults, required fields, and env var expectations.")
+        actions.append("逐项比对配置 schema、默认值、必填项和环境变量约定。")
     if "security" in categories:
-        actions.append("确认受影响版本范围，并优先在预生产环境验证修复路径。" if zh else "Assess affected versions and prioritize validation in pre-production.")
+        actions.append("确认受影响版本范围，并优先在预生产环境验证修复路径。")
     if "performance" in categories:
-        actions.append("在关键路径运行回归、压力、启动或长稳测试。" if zh else "Run regression, stress, startup, or soak tests on critical paths.")
+        actions.append("在关键路径运行回归、压力、启动或长稳测试。")
     if "fix" in categories and not any(cat in categories for cat in ["breaking", "migration", "security", "performance"]):
-        actions.append("如果你正受同类问题影响，优先复现旧问题并确认修复是否生效。" if zh else "If you are affected, reproduce the old issue and confirm the fix.")
+        actions.append("如果你正受同类问题影响，优先复现旧问题并确认修复是否生效。")
     if not actions:
-        actions.append((f"如果依赖 {component} 相关能力，先在非生产环境完成验证再升级。" if zh else f"If you rely on {component}-related functionality, validate it outside production before upgrading."))
+        actions.append(f"如果依赖 {component} 相关能力，先在非生产环境完成验证再升级。")
     if risk == "high":
-        rollback_text = "准备回滚方案，并明确升级失败后的恢复路径。" if zh else "Prepare a rollback plan and define the recovery path before rollout."
+        rollback_text = "准备回滚方案，并明确升级失败后的恢复路径。"
         if rollback_text not in actions:
             actions.append(rollback_text)
     deduped: List[str] = []
@@ -1496,12 +1527,12 @@ def select_important_files(
 def format_diff_summary(files: List[Dict[str, Any]], lang: str = "zh") -> str:
     """Format selected file changes into a concise text summary for LLM prompt."""
     lines: List[str] = []
-    header = "代码变更摘要（按重要性排序）" if lang == "zh" else "Code Change Summary (sorted by importance)"
+    header = "代码变更摘要（按重要性排序）"
     lines.append(f"## {header}")
     lines.append("")
     total_add = sum(f.get("additions", 0) for f in files)
     total_del = sum(f.get("deletions", 0) for f in files)
-    stats = f"共 {len(files)} 个文件，+{total_add}/-{total_del}" if lang == "zh" else f"{len(files)} files, +{total_add}/-{total_del}"
+    stats = f"共 {len(files)} 个文件，+{total_add}/-{total_del}"
     lines.append(f"*{stats}*")
     lines.append("")
     for f in files:
@@ -1511,19 +1542,16 @@ def format_diff_summary(files: List[Dict[str, Any]], lang: str = "zh") -> str:
         status_zh = {"added": "新增", "removed": "删除", "modified": "修改", "renamed": "重命名"}.get(status, status)
         status_en = status
         score = f.get("importance_score", 0)
-        if lang == "zh":
-            lines.append(f"### {fname} ({status_zh}, +{f['additions']}/-{f['deletions']}, 重要性:{score})")
-        else:
-            lines.append(f"### {fname} ({status_en}, +{f['additions']}/-{f['deletions']}, importance:{score})")
+        lines.append(f"### {fname} ({status_zh}, +{f['additions']}/-{f['deletions']}, 重要性:{score})")
         if prev:
-            lines.append(f"*Previous name: {prev}*" if lang == "en" else f"*原文件名: {prev}*")
+            lines.append(f"*原文件名: {prev}*")
         patch = f.get("patch", "")
         if patch:
             lines.append("```diff")
             lines.append(patch)
             lines.append("```")
         else:
-            lines.append("*(binary or patch unavailable)*" if lang == "en" else "*(二进制文件或 patch 不可用)*")
+            lines.append("*(二进制文件或 patch 不可用)*")
         lines.append("")
     return "\n".join(lines)
 
@@ -1685,6 +1713,418 @@ def merge_categories(classified: Iterable[Dict[str, List[str]]]) -> Dict[str, Li
                 if value not in merged[key]:
                     merged[key].append(value)
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Recursive merge aggregation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LeafGroup:
+    """A group of consecutive releases to be analyzed as a single leaf node."""
+    releases: List[Release]
+    analyses: List[ChangeAnalysis]
+    commits: List[CommitInfo]
+    diff_files: List[Dict[str, Any]]
+
+
+def _estimate_leaf_tokens(analyses: List[ChangeAnalysis], commits: List[CommitInfo]) -> int:
+    """Estimate token count for a leaf group.
+
+    Uses the same heuristic as estimate_data_tokens: characters * TOKENS_PER_CHAR.
+    """
+    # Approximate notes text
+    notes_chars = sum(len(a.raw_text) for a in analyses)
+    # Approximate commits text (message + files)
+    commits_chars = sum(
+        len(c.message) + sum(len(f) for f in c.changed_files)
+        for c in commits
+    )
+    # Meta + instructions overhead
+    overhead = 5000
+    total = notes_chars + commits_chars + overhead
+    return int(total * 1.3)
+
+
+def build_leaf_groups(
+    scoped_releases: List[Release],
+    all_analyses: List[ChangeAnalysis],
+    all_commits: List[CommitInfo],
+    all_diff_files: List[Dict[str, Any]],
+) -> List[LeafGroup]:
+    """Build leaf groups by token budget (vertical partitioning).
+
+    Strategy:
+    - Accumulate versions until adding the next would exceed token budget.
+    - Each group contains 1-3 versions (hard cap).
+    - Each group gets notes + commits for its version range.
+    """
+    if not scoped_releases:
+        return []
+
+    groups: List[LeafGroup] = []
+    current_releases: List[Release] = []
+
+    for i, release in enumerate(scoped_releases):
+        # Collect analyses for this release
+        release_analyses = [a for a in all_analyses if a.release_tag == release.tag_name]
+
+        # Estimate commits for this release's range
+        # For the first release in the group, we need commits from the previous
+        # release (or all commits up to this point if it's the first overall)
+        if not current_releases:
+            # Starting a new group: include all commits up to this release
+            # (in practice, commits are fetched per-range, so we use proportional estimate)
+            est_commits = len(all_commits) // len(scoped_releases)
+        else:
+            est_commits = len(all_commits) // len(scoped_releases)
+
+        est_tokens = _estimate_leaf_tokens(release_analyses, [])
+        # Add overhead for estimated commits
+        est_tokens += est_commits * 300  # ~300 chars per commit
+
+        # Check if adding this release would exceed budget
+        current_analyses = [a for a in all_analyses
+                           if a.release_tag in {r.tag_name for r in current_releases}]
+        current_tokens = _estimate_leaf_tokens(current_analyses, [])
+        current_tokens += len(current_releases) * est_commits * 300
+
+        would_exceed = (
+            current_tokens + est_tokens > RECURSIVE_MERGE_MAX_TOKENS_PER_LEAF
+            and current_releases
+        )
+        would_exceed_versions = len(current_releases) >= RECURSIVE_MERGE_MAX_VERSIONS_PER_LEAF
+
+        if would_exceed or would_exceed_versions:
+            # Finalize current group
+            group_releases = current_releases
+            group_analyses = [a for a in all_analyses
+                             if a.release_tag in {r.tag_name for r in group_releases}]
+            # Assign a proportional slice of commits and diff files
+            group_commits, group_diffs = _slice_commits_and_diffs(
+                group_releases, scoped_releases, all_commits, all_diff_files
+            )
+            groups.append(LeafGroup(
+                releases=group_releases,
+                analyses=group_analyses,
+                commits=group_commits,
+                diff_files=group_diffs,
+            ))
+            current_releases = [release]
+        else:
+            current_releases.append(release)
+
+    # Finalize last group
+    if current_releases:
+        group_analyses = [a for a in all_analyses
+                         if a.release_tag in {r.tag_name for r in current_releases}]
+        group_commits, group_diffs = _slice_commits_and_diffs(
+            current_releases, scoped_releases, all_commits, all_diff_files
+        )
+        groups.append(LeafGroup(
+            releases=current_releases,
+            analyses=group_analyses,
+            commits=group_commits,
+            diff_files=group_diffs,
+        ))
+
+    return groups
+
+
+def _slice_commits_and_diffs(
+    group_releases: List[Release],
+    all_releases: List[Release],
+    all_commits: List[CommitInfo],
+    all_diff_files: List[Dict[str, Any]],
+) -> Tuple[List[CommitInfo], List[Dict[str, Any]]]:
+    """Assign a proportional slice of commits and diff files to a leaf group.
+
+    This is a simple proportional allocation. In practice, commits and diffs
+    are fetched per-group via the compare API; this function provides a
+    fallback when pre-fetched data is available.
+    """
+    if not all_releases or not group_releases:
+        return [], []
+
+    n_group = len(group_releases)
+    n_total = len(all_releases)
+
+    # Proportional slice of commits
+    if all_commits:
+        n_commits = max(1, len(all_commits) * n_group // n_total)
+        # Take from the start of the all_commits list (assumes chronological order)
+        # Find the position of group_releases in all_releases
+        start_idx = all_releases.index(group_releases[0]) if group_releases[0] in all_releases else 0
+        commit_start = start_idx * len(all_commits) // n_total
+        commit_end = min(len(all_commits), commit_start + n_commits + 10)
+        group_commits = all_commits[commit_start:commit_end]
+    else:
+        group_commits = []
+
+    # Proportional slice of diff files
+    if all_diff_files:
+        n_files = max(1, len(all_diff_files) * n_group // n_total)
+        start_idx = all_releases.index(group_releases[0]) if group_releases[0] in all_releases else 0
+        file_start = start_idx * len(all_diff_files) // n_total
+        file_end = min(len(all_diff_files), file_start + n_files + 5)
+        group_diffs = all_diff_files[file_start:file_end]
+    else:
+        group_diffs = []
+
+    return group_commits, group_diffs
+
+
+def analyze_recursive(
+    repo: str,
+    scoped_releases: List[Release],
+    all_analyses: List[ChangeAnalysis],
+    all_commits: List[CommitInfo],
+    all_diff_files: List[Dict[str, Any]],
+    lang: str,
+    github_token: Optional[str],
+    snapshot_dir: Path,
+) -> Tuple[Optional[LLMFullReport], List[str]]:
+    """Perform recursive merge aggregation analysis (external-LLM workflow).
+
+    This function orchestrates the recursive analysis pipeline:
+    1. Build leaf groups (vertical partitioning)
+    2. Generate leaf analysis data files
+    3. Check for cached leaf LLM results
+    4. If all leaf results exist: recursively merge them
+    5. At each merge level: check for cached merge results, or generate prompts
+    6. Return final report + list of missing files (if any)
+
+    Returns (final_report_or_None, missing_files).
+    If missing_files is non-empty, the caller should prompt the user to
+    run LLM analysis on those files before re-running.
+    """
+    target_tag = scoped_releases[-1].tag_name if scoped_releases else "unknown"
+
+    # Step 1: Build leaf groups
+    leaf_groups = build_leaf_groups(scoped_releases, all_analyses, all_commits, all_diff_files)
+    print(
+        f"Info: Recursive merge: {len(scoped_releases)} versions → {len(leaf_groups)} leaf groups",
+        file=sys.stderr,
+    )
+    for i, g in enumerate(leaf_groups):
+        tags = ", ".join(r.tag_name for r in g.releases)
+        print(
+            f"  Leaf {i+1}: {tags} ({len(g.analyses)} notes, {len(g.commits)} commits)",
+            file=sys.stderr,
+        )
+
+    # Step 2: Generate leaf analysis data and check for cached results
+    leaf_results: List[LLMFullReport] = []
+    missing: List[str] = []
+
+    for i, group in enumerate(leaf_groups):
+        target = group.releases[-1]
+        compare = group.releases[0]
+        all_tags = [r.tag_name for r in scoped_releases]
+        group_start_idx = all_tags.index(compare.tag_name) if compare.tag_name in all_tags else -1
+        compare_base = scoped_releases[group_start_idx - 1] if group_start_idx > 0 else None
+
+        # Fetch commits/diffs if not pre-fetched
+        group_commits = group.commits
+        group_diffs = group.diff_files
+        if not group_commits and compare_base:
+            try:
+                raw_commits = fetch_compare_commits(repo, compare_base.tag_name, target.tag_name, github_token)
+                group_commits = select_relevant_commits(raw_commits)
+            except Exception as exc:
+                print(f"Warning: Could not fetch commits for leaf group {i+1}: {exc}", file=sys.stderr)
+        if not group_diffs and compare_base:
+            try:
+                raw_files = fetch_compare_diff(repo, compare_base.tag_name, target.tag_name, github_token)
+                group_diffs = select_important_files(raw_files)
+            except Exception as exc:
+                print(f"Warning: Could not fetch diff for leaf group {i+1}: {exc}", file=sys.stderr)
+
+        # Build and write leaf analysis data
+        data = build_analysis_data(
+            repo=repo,
+            target=target,
+            compare=compare_base,
+            analyses=group.analyses,
+            commits=group_commits,
+            diff_files=group_diffs,
+            lang=lang,
+            scoped_releases=group.releases,
+        )
+        leaf_data_path = _leaf_data_path(snapshot_dir, repo, target_tag, i)
+        write_analysis_data(data, leaf_data_path)
+        print(f"  LEAF_DATA[{i+1}]: {leaf_data_path}", file=sys.stderr)
+
+        # Check for cached leaf result
+        leaf_result_path = _leaf_result_path(snapshot_dir, repo, target_tag, i)
+        if leaf_result_path.exists():
+            print(f"  LEAF_RESULT[{i+1}]: {leaf_result_path} (cached)", file=sys.stderr)
+            leaf_results.append(parse_llm_results(leaf_result_path))
+        else:
+            print(f"  LEAF_RESULT[{i+1}]: MISSING — please analyze {leaf_data_path}", file=sys.stderr)
+            leaf_results.append(LLMFullReport())
+            missing.append(str(leaf_data_path))
+
+    # If any leaf results are missing, we can't proceed
+    if missing:
+        return None, missing
+
+    # Step 3: Recursive merge with prompt generation for missing merge results
+    final_report, merge_missing = _recursive_merge_with_prompts(
+        leaf_results, repo, target_tag, snapshot_dir, depth=0, lang=lang
+    )
+    missing.extend(merge_missing)
+
+    return final_report, missing
+
+
+def _recursive_merge_with_prompts(
+    results: List[LLMFullReport],
+    repo: str,
+    target_tag: str,
+    snapshot_dir: Path,
+    depth: int = 0,
+    lang: str = "zh",
+) -> Tuple[Optional[LLMFullReport], List[str]]:
+    """Recursively merge results, generating prompts for missing merge layers.
+
+    Returns (final_report_or_None, missing_files).
+    """
+    if depth > RECURSIVE_MERGE_MAX_DEPTH:
+        raise RuntimeError(f"Recursive merge exceeded max depth ({RECURSIVE_MERGE_MAX_DEPTH})")
+
+    if len(results) == 1:
+        return results[0], []
+
+    merged: List[LLMFullReport] = []
+    missing: List[str] = []
+
+    for i in range(0, len(results), 2):
+        if i + 1 < len(results):
+            a, b = results[i], results[i + 1]
+
+            # Skip empty results
+            if not a.themes and not b.themes:
+                merged.append(LLMFullReport())
+                continue
+            if not a.themes:
+                merged.append(b)
+                continue
+            if not b.themes:
+                merged.append(a)
+                continue
+
+            # Check for cached merge result
+            merge_result_path = _merge_result_path(snapshot_dir, repo, target_tag, depth, i // 2)
+            if merge_result_path.exists():
+                print(
+                    f"  MERGE_RESULT[d{depth}-{i//2}]: {merge_result_path} (cached)",
+                    file=sys.stderr,
+                )
+                merged.append(parse_merge_results(merge_result_path.read_text(encoding="utf-8")))
+                continue
+
+            # Generate merge prompt
+            compressed_a = compress_for_merge(a)
+            compressed_b = compress_for_merge(b)
+            prompt = build_merge_prompt(compressed_a, compressed_b, lang)
+            prompt_path = _merge_prompt_path(snapshot_dir, repo, target_tag, depth, i // 2)
+            prompt_path.write_text(prompt, encoding="utf-8")
+            print(
+                f"  MERGE_PROMPT[d{depth}-{i//2}]: {prompt_path} — please analyze and save result to {merge_result_path}",
+                file=sys.stderr,
+            )
+
+            # Use fallback merge so we can continue checking deeper layers
+            merged.append(_fallback_merge(a, b))
+            missing.append(str(prompt_path))
+        else:
+            # Odd node: pass through
+            merged.append(results[i])
+
+    # Recurse to next level, combining missing files from all levels
+    final_report, deeper_missing = _recursive_merge_with_prompts(
+        merged, repo, target_tag, snapshot_dir, depth + 1, lang
+    )
+    missing.extend(deeper_missing)
+    return final_report, missing
+
+
+def _fallback_merge(a: LLMFullReport, b: LLMFullReport) -> LLMFullReport:
+    """Fallback pure-Python merge when LLM merge result is not yet available.
+
+    This produces a best-effort merged result using the same rules as
+    merge_chunk_results. When the LLM merge result becomes available,
+    it should replace this fallback.
+    """
+    merged = LLMFullReport()
+
+    # Themes: union by theme_id
+    seen_themes: set[str] = set()
+    for t in a.themes + b.themes:
+        if t.theme_id not in seen_themes:
+            merged.themes.append(t)
+            seen_themes.add(t.theme_id)
+
+    # Detailed notes: union by note_id
+    seen_notes: set[str] = set()
+    for n in a.detailed_notes + b.detailed_notes:
+        if n.note_id not in seen_notes:
+            merged.detailed_notes.append(n)
+            seen_notes.add(n.note_id)
+
+    # Progressive fixes: union by fix_id
+    seen_fixes: set[str] = set()
+    for pf in a.progressive_fixes + b.progressive_fixes:
+        if pf.fix_id not in seen_fixes:
+            merged.progressive_fixes.append(pf)
+            seen_fixes.add(pf.fix_id)
+
+    # Version evolution: union by evolution_id
+    seen_evo: set[str] = set()
+    for ve in a.version_evolution + b.version_evolution:
+        if ve.evolution_id not in seen_evo:
+            merged.version_evolution.append(ve)
+            seen_evo.add(ve.evolution_id)
+
+    # Compatibility risks: dedup by component
+    seen_risks: set[str] = set()
+    for cr in a.compatibility_risks + b.compatibility_risks:
+        key = f"{cr.component}:{cr.description[:50]}"
+        if key not in seen_risks:
+            merged.compatibility_risks.append(cr)
+            seen_risks.add(key)
+
+    # Test points: dedup
+    seen_tp: set[str] = set()
+    for tp in a.test_points + b.test_points:
+        if tp not in seen_tp:
+            merged.test_points.append(tp)
+            seen_tp.add(tp)
+
+    # Shadow changes: dedup by description
+    seen_shadow: set[str] = set()
+    for sc in a.shadow_changes + b.shadow_changes:
+        desc = sc.get("description", "")[:50] if isinstance(sc, dict) else str(sc)[:50]
+        if desc not in seen_shadow:
+            merged.shadow_changes.append(sc)
+            seen_shadow.add(desc)
+
+    # Executive summary: prefer non-empty from either side
+    if a.executive_summary and a.executive_summary.one_liner:
+        merged.executive_summary = a.executive_summary
+    elif b.executive_summary and b.executive_summary.one_liner:
+        merged.executive_summary = b.executive_summary
+
+    # Developer conclusion: prefer non-empty
+    if a.developer_conclusion:
+        merged.developer_conclusion = a.developer_conclusion
+    elif b.developer_conclusion:
+        merged.developer_conclusion = b.developer_conclusion
+
+    return merged
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Analyze OpenClaw GitHub releases")
     parser.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repo in owner/name format")
@@ -1696,13 +2136,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-beta", action="store_true", help="Include prerelease preview section")
     parser.add_argument(
         "--lang",
-        choices=["en", "zh", "auto"],
-        default="auto",
-        help="Report language: en=English, zh=Chinese, auto=detect from user input (default: auto)",
+        choices=["zh"],
+        default="zh",
+        help="(deprecated) Report language is always Chinese.",
     )
     parser.add_argument(
         "--user-query",
-        help="P0-3: User's original query text, used for language auto-detection when --lang auto is used.",
+        help="P0-3: User's original query text (retained for backward compatibility).",
     )
     parser.add_argument(
         "--github-token",
@@ -1741,7 +2181,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-llm",
         action="store_true",
-        help="Disable LLM enhancement. Use only rule-based analysis.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--prepare-chunks",
@@ -1756,6 +2196,14 @@ def build_parser() -> argparse.ArgumentParser:
              "Use after all chunks have been processed by LLM.",
     )
     parser.add_argument(
+        "--recursive-analysis",
+        action="store_true",
+        help="Use recursive merge aggregation for multi-version analysis. "
+             "Partitions versions into leaf groups, analyzes each with LLM, "
+             "then recursively merges results for cross-version progressive fix "
+             "detection and cumulative risk assessment.",
+    )
+    parser.add_argument(
         "--clean-cache",
         action="store_true",
         help="Remove all cached snapshot and intermediate files, then exit.",
@@ -1766,15 +2214,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_lang(args: argparse.Namespace) -> str:
-    """Resolve report language from CLI args."""
-    lang = args.lang
-    if lang == "auto":
-        sample = args.user_query or " ".join(
-            filter(None, [args.target or "", args.compare or "", args.from_version or "",
-                           args.to_version or "", args.repo or ""])
-        )
-        lang = detect_language(sample)
-    return lang
+    """Report language is always Chinese."""
+    return "zh"
 
 
 def _build_categories_from_analyses(analyses: List[ChangeAnalysis]) -> Dict[str, List[str]]:
@@ -1790,6 +2231,41 @@ def _build_categories_from_analyses(analyses: List[ChangeAnalysis]) -> Dict[str,
             if key in item.categories and item.raw_text not in categories[key]:
                 categories[key].append(item.raw_text)
     return categories
+
+
+# ---------------------------------------------------------------------------
+# Recursive merge: file path helpers
+# ---------------------------------------------------------------------------
+
+def _leaf_data_path(snapshot_dir: Path, repo: str, target_tag: str, idx: int) -> Path:
+    repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
+    target_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", target_tag).strip("-") or "target"
+    return snapshot_dir / f"{repo_part}-{target_part}-leaf-{idx:03d}-analysis-data.json"
+
+
+def _leaf_result_path(snapshot_dir: Path, repo: str, target_tag: str, idx: int) -> Path:
+    repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
+    target_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", target_tag).strip("-") or "target"
+    return snapshot_dir / f"{repo_part}-{target_part}-leaf-{idx:03d}-llm-results.json"
+
+
+def _merge_prompt_path(snapshot_dir: Path, repo: str, target_tag: str, depth: int, idx: int) -> Path:
+    repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
+    target_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", target_tag).strip("-") or "target"
+    return snapshot_dir / f"{repo_part}-{target_part}-merge-d{depth}-{idx:03d}-prompt.txt"
+
+
+def _merge_result_path(snapshot_dir: Path, repo: str, target_tag: str, depth: int, idx: int) -> Path:
+    repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
+    target_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", target_tag).strip("-") or "target"
+    return snapshot_dir / f"{repo_part}-{target_part}-merge-d{depth}-{idx:03d}-result.json"
+
+
+def _recursive_final_path(snapshot_dir: Path, repo: str, target_tag: str) -> Path:
+    """Path for the final merged recursive analysis result."""
+    repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
+    target_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", target_tag).strip("-") or "target"
+    return snapshot_dir / f"{repo_part}-{target_part}-recursive-merged.json"
 
 
 def _load_snapshot_or_fetch(args: argparse.Namespace) -> Tuple[Release, Optional[Release], List[Release], List[Release], Path]:
@@ -1890,7 +2366,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         resolved_token = get_github_token(args.github_token)
         token_valid, token_error = verify_github_token(resolved_token)
         lang = _resolve_lang(args)
-        strings = _zh() if lang == "zh" else _en()
+        strings = _zh()
 
         if token_valid:
             args.github_token = resolved_token
@@ -1902,9 +2378,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"{strings['token_invalid_warning']} ({token_error})", file=sys.stderr)
             else:
                 print(f"{strings['token_missing_warning']}", file=sys.stderr)
-            if not args.no_llm:
-                print("Info: No valid token available; forcing rule-based analysis only.", file=sys.stderr)
-                args.no_llm = True
+            raise RuntimeError(
+                "无法继续分析：GitHub token 无效或缺失。"
+                "本分析工具要求有效的 GitHub token 来获取 commits 和 diff 数据，"
+                "这是 LLM 增强分析的必要前提。"
+                "请通过 --github-token 参数或 GITHUB_TOKEN 环境变量提供有效 token。"
+            )
 
         # -------------------------------------------------------------------
         # Internal helper: prepare analysis data (shared by Mode A and Mode C)
@@ -2042,10 +2521,205 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _run_merge_chunk_results_mode()
 
         # -------------------------------------------------------------------
+        # Mode R: Recursive merge aggregation
+        # -------------------------------------------------------------------
+        if args.recursive_analysis:
+            # Load snapshot
+            target, compare, scoped, releases, snapshot = refresh_snapshot_and_load(args)
+            _lang = _resolve_lang(args)
+
+            # Degenerate case: single version or too few versions
+            if len(scoped) < RECURSIVE_MERGE_MIN_VERSIONS:
+                print(
+                    f"Info: Only {len(scoped)} version(s) in scope; "
+                    f"falling back to standard single-pass analysis.",
+                    file=sys.stderr,
+                )
+                # Fall through to standard Mode C / Mode B flow
+            else:
+                _cleanup_transient_files(snapshot_dir, args.repo, target.tag_name)
+
+                import concurrent.futures
+
+                def _do_rule_analysis() -> List[ChangeAnalysis]:
+                    return analyze_release_notes(scoped, _lang)
+
+                def _do_diff_fetch() -> List[Dict[str, Any]]:
+                    if not compare:
+                        return []
+                    try:
+                        all_files = fetch_compare_diff(
+                            args.repo, compare.tag_name, target.tag_name, args.github_token
+                        )
+                        return select_important_files(all_files)
+                    except Exception as exc:
+                        print(f"Warning: Could not fetch compare diff: {exc}", file=sys.stderr)
+                        return []
+
+                def _do_commit_fetch() -> List[CommitInfo]:
+                    if not compare:
+                        return []
+                    try:
+                        all_commits = fetch_compare_commits(
+                            args.repo, compare.tag_name, target.tag_name, args.github_token
+                        )
+                        return select_relevant_commits(all_commits)
+                    except Exception as exc:
+                        print(f"Warning: Could not fetch compare commits: {exc}", file=sys.stderr)
+                        return []
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                    future_analysis = executor.submit(_do_rule_analysis)
+                    future_diff = executor.submit(_do_diff_fetch)
+                    future_commits = executor.submit(_do_commit_fetch)
+                    analyses = future_analysis.result()
+                    diff_files = future_diff.result()
+                    commits = future_commits.result()
+
+                # Run recursive analysis
+                final_report, missing = analyze_recursive(
+                    repo=args.repo,
+                    scoped_releases=list(scoped),
+                    all_analyses=analyses,
+                    all_commits=commits,
+                    all_diff_files=diff_files,
+                    lang=_lang,
+                    github_token=args.github_token,
+                    snapshot_dir=snapshot_dir,
+                )
+
+                if missing:
+                    print(f"\n=== Recursive Analysis: {len(missing)} item(s) need LLM processing ===", file=sys.stderr)
+                    for m in missing:
+                        print(f"  MISSING: {m}", file=sys.stderr)
+                    print(
+                        "\nPlease run LLM analysis on the above files and save results to the "
+                        "corresponding result paths, then re-run with --recursive-analysis.",
+                        file=sys.stderr,
+                    )
+                    return 1
+
+                if final_report is None:
+                    print("Error: Recursive analysis failed to produce a final report.", file=sys.stderr)
+                    return 1
+
+                # Save final merged result as the canonical llm-results.json
+                final_path = llm_results_path(snapshot_dir, args.repo, target.tag_name)
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                # Convert LLMFullReport to dict for serialization
+                final_dict = {
+                    "executive_summary": {
+                        "recommendation": final_report.executive_summary.recommendation,
+                        "theme": final_report.executive_summary.theme,
+                        "magnitude": final_report.executive_summary.magnitude,
+                        "reason": final_report.executive_summary.reason,
+                        "top_changes": final_report.executive_summary.top_changes,
+                        "one_liner": final_report.executive_summary.one_liner,
+                    },
+                    "developer_conclusion": final_report.developer_conclusion,
+                    "themes": [
+                        {
+                            "theme_id": t.theme_id,
+                            "theme_name": t.theme_name,
+                            "note_ids": t.note_ids,
+                            "raw_texts": t.raw_texts,
+                            "primary_category": t.primary_category,
+                            "risk_level": t.risk_level,
+                            "summary": t.summary,
+                            "impact": t.impact,
+                            "related_commits": t.related_commits,
+                            "affected_files": t.affected_files,
+                            "confidence": t.confidence,
+                            "has_hidden_breaking": t.has_hidden_breaking,
+                            "hidden_risks": t.hidden_risks,
+                            "reasoning": t.reasoning,
+                        }
+                        for t in final_report.themes
+                    ],
+                    "detailed_notes": [
+                        {
+                            "note_id": n.note_id,
+                            "component": n.component,
+                            "categories": n.categories,
+                            "risk_level": n.risk_level,
+                            "interpretation": n.interpretation,
+                            "action_items": n.action_items,
+                            "audience": n.audience,
+                            "matched_commits": n.matched_commits,
+                            "affected_files": n.affected_files,
+                            "has_hidden_breaking": n.has_hidden_breaking,
+                            "reasoning": n.reasoning,
+                        }
+                        for n in final_report.detailed_notes
+                    ],
+                    "compatibility_risks": [
+                        {"component": cr.component, "description": cr.description}
+                        for cr in final_report.compatibility_risks
+                    ],
+                    "test_points": final_report.test_points,
+                    "shadow_changes": final_report.shadow_changes,
+                    "progressive_fixes": [
+                        {
+                            "fix_id": pf.fix_id,
+                            "issue_description": pf.issue_description,
+                            "stages": pf.stages,
+                            "final_status": pf.final_status,
+                            "impact_assessment": pf.impact_assessment,
+                            "affected_components": pf.affected_components,
+                        }
+                        for pf in final_report.progressive_fixes
+                    ],
+                    "version_evolution": [
+                        {
+                            "evolution_id": ve.evolution_id,
+                            "description": ve.description,
+                            "affected_versions": ve.affected_versions,
+                            "individual_risk": ve.individual_risk,
+                            "cumulative_risk": ve.cumulative_risk,
+                            "risk_escalation_reason": ve.risk_escalation_reason,
+                            "related_themes": ve.related_themes,
+                            "affected_components": ve.affected_components,
+                            "migration_advice": ve.migration_advice,
+                        }
+                        for ve in final_report.version_evolution
+                    ],
+                }
+                final_path.write_text(json.dumps(final_dict, ensure_ascii=False, indent=2), encoding="utf-8")
+                print(f"RECURSIVE_MERGE_COMPLETE: 1")
+                print(f"LLM_RESULTS: {final_path}")
+
+                # Generate report using the recursive result
+                categories = _build_categories_from_analyses(analyses)
+                if args.output:
+                    output_path = Path(args.output)
+                else:
+                    output_path = Path.cwd() / f"{snapshot.stem}-analysis.md"
+
+                report = render_report(
+                    repo=args.repo,
+                    target=target,
+                    compare=compare,
+                    scoped=scoped,
+                    releases=releases,
+                    include_beta=args.include_beta,
+                    lang=_lang,
+                    data_source="Fresh GitHub Releases API + Compare Diff + Recursive LLM Merge Analysis",
+                    snapshot_file=str(snapshot),
+                    output_file=str(output_path),
+                    analyses=analyses,
+                    categories=categories,
+                    llm_report=final_report,
+                )
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(report, encoding="utf-8")
+                print(str(output_path))
+                return 0
+
+        # -------------------------------------------------------------------
         # Mode C: Default — token-aware routing (check BEFORE Mode B)
         # -------------------------------------------------------------------
-        # If token is valid and not --no-llm, auto-trigger analysis data preparation
-        if token_valid and not args.no_llm and not args.apply_llm_results:
+        # If token is valid, auto-trigger analysis data preparation
+        if token_valid and not args.apply_llm_results:
             # Resolve actual target tag for cache path (handles --latest mode)
             target_for_path = args.target
             if not target_for_path:
@@ -2109,7 +2783,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             target, compare, scoped, releases, snapshot = _load_snapshot_or_fetch(args)
             lang = _resolve_lang(args)
 
-            # Load cached base analysis or recompute (for fallback / no-llm mode)
+            # Load cached base analysis or recompute
             # Validate that cached base analysis matches current snapshot before reuse
             base_path = base_analysis_path(snapshot_dir, args.repo, target.tag_name)
             analyses: List[ChangeAnalysis] = []
@@ -2169,43 +2843,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _cleanup_legacy_prompts(snapshot_dir, args.repo, target.tag_name)
             return 0
 
-        # Rule-based analysis only (token missing/invalid or --no-llm)
-        target, compare, scoped, releases, snapshot = refresh_snapshot_and_load(args)
-        _lang = _resolve_lang(args)
-        _strings = _zh() if _lang == "zh" else _en()
-
-        classified = [classify_release(r) for r in scoped]
-        categories = merge_categories(classified)
-        analyses = analyze_release_notes(scoped, _lang)
-
-        # Default output to current working directory
-        if args.output:
-            output_path = Path(args.output)
-        else:
-            output_path = Path.cwd() / f"{snapshot.stem}-analysis.md"
-
-        report = render_report(
-            repo=args.repo,
-            target=target,
-            compare=compare,
-            scoped=scoped,
-            releases=releases,
-            include_beta=args.include_beta,
-            lang=_lang,
-            data_source=_strings["analysis_mode_rule_only"],
-            snapshot_file=str(snapshot),
-            output_file=str(output_path),
-            analyses=analyses,
-            categories=categories,
+        # LLM analysis is mandatory. This code path should not be reached
+        # because token validation above raises an error when token is invalid.
+        raise RuntimeError(
+            "无法继续分析：缺少 LLM 分析结果。"
+            "本分析工具要求通过 LLM 增强分析来获取高质量的分析结果。"
+            "请确保已提供有效的 GitHub token，让脚本进入 LLM 分析数据准备模式，"
+            "然后由 AI agent 执行 LLM 分析后再生成报告。"
         )
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(report, encoding="utf-8")
-        print(str(output_path))
-
-        # Clean up step-internal transient files after report generation
-        _cleanup_transient_files(snapshot_dir, args.repo, target.tag_name)
-        return 0
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

@@ -1,185 +1,180 @@
 ---
 name: openclaw-release-analyzer
-description: This skill should be used when analyzing OpenClaw GitHub releases, release notes, version comparisons, upgrade impact, bug fixes, new features, plugin-system changes, API/SDK changes, security fixes, performance/stability changes, beta/prerelease previews, or OpenClaw upgrade recommendations.
+description: 本 Skill 用于分析 OpenClaw GitHub release、release notes、版本对比、升级影响、bug fix、新增 feature、插件系统变化、API/SDK 变化、安全修复、性能/稳定性变化、beta/prerelease 预览，以及 OpenClaw 升级建议。
 ---
 
 # OpenClaw Release Analyzer
 
-## Overview
+## 概述
 
-Analyze OpenClaw release notes and GitHub release metadata to help developers understand what changed between versions and decide whether to upgrade. Focus on bug fixes, new features, plugin-system impact, API/SDK impact, security fixes, performance/stability changes, breaking-change risk, and scenario-based upgrade recommendations.
+分析 OpenClaw release notes 和 GitHub release metadata，帮助开发者了解版本间变化并判断是否升级。重点关注 bug fix、新增 feature、插件系统影响、API/SDK 影响、安全修复、性能/稳定性变化、breaking-change 风险，以及场景化升级建议。
 
-**Output language**: the report is generated in the language matching the user's input. Technical proper nouns (OpenClaw, API, SDK, CLI, hook, manifest, plugin, etc.) are always kept in English for clarity.
+**输出语言**：本 Skill 固定输出中文报告。技术专有名词（OpenClaw, API, SDK, CLI, hook, manifest, plugin 等）保持英文以确保语义准确。
 
-## Use Cases
+## 适用场景
 
-Invoke this skill for requests such as:
+在以下场景中调用本 Skill：
 
-- Analyze the latest OpenClaw release.
-- Compare two OpenClaw versions.
-- Summarize changes across a version range.
-- Check whether an OpenClaw update includes important bug fixes or features.
-- Evaluate upgrade impact for plugin developers, API/SDK users, security-sensitive users, stability-sensitive users, or ordinary users.
-- Preview newer beta, alpha, or release-candidate versions without treating them as default upgrade targets.
-- Inspect OpenClaw release notes for plugin, API, SDK, security, performance, or breaking-change signals.
+- 分析最新 OpenClaw release
+- 对比两个 OpenClaw 版本
+- 汇总某个版本范围内的变化
+- 检查 OpenClaw 更新是否包含重要 bug fix 或 feature
+- 评估升级对插件开发者、API/SDK 使用者、安全敏感用户、稳定性敏感用户或普通用户的影响
+- 预览较新的 beta、alpha 或 release-candidate 版本，但不将其作为默认升级目标
+- 检查 OpenClaw release notes 中的插件、API、SDK、安全、性能或 breaking-change 信号
 
-## Default Behavior
+## 默认行为
 
-- Analyze `openclaw/openclaw` unless a different repository is explicitly requested.
-- **Always verify GitHub token before any API call.** The script checks token validity via `/rate_limit`; token can be provided via `--github-token` or the `GITHUB_TOKEN` environment variable.
-- **Token valid** → automatically enter **LLM-enhanced diff analysis mode** (significantly more accurate than rule-based analysis).
-- **Token invalid or missing** → automatically fall back to **rule-based analysis only**, print a warning to stderr, and mark the report data source as "rule-based only".
-- Always start each analysis run by fetching the latest release metadata and release notes from GitHub Releases API.
-- Always write the fetched data into a fresh local snapshot before analysis.
-- Always analyze the freshly written local snapshot for the current run; do not analyze directly from repeated API reads.
-- Do not offer or use alternate data-source modes such as offline local-file input, cache reuse, `--use-cache`, or manual `--refresh` switching.
-- Treat non-draft, non-prerelease releases as stable releases.
-- By default, compare the latest stable release against the previous stable release.
-- Mention beta/prerelease versions newer than the latest stable only as forward-looking previews.
-- Do not scan the user's local project unless explicitly requested and authorized.
-- Separate facts from inference and uncertainty.
-- Include per-release-note interpretation with impact audience, risk level, confidence, and suggested actions.
-- Avoid claiming internal refactors affect developers unless public surface changes are evidenced.
+- 除非用户明确指定其他仓库，否则默认分析 `openclaw/openclaw`。
+- **在任何 API 调用之前，始终验证 GitHub token。** 脚本通过 `/rate_limit` 接口验证 token 有效性；token 可通过 `--github-token` 参数或 `GITHUB_TOKEN` 环境变量提供。
+- **Token 有效** → 自动进入 **LLM 增强 diff 分析模式**（相比纯规则分析，准确度显著提升）。
+- **Token 无效或缺失** → **报错停止，不生成报告**。本 Skill 要求 LLM 分析作为必需步骤，不允许回退到仅规则分析。
+- 每次分析开始时，先从 GitHub Releases API 获取最新的 release metadata 和 release notes。
+- 分析前始终将获取的数据写入新的本地 snapshot。
+- 始终基于刚写入的本地 snapshot 进行分析，不要直接从重复 API 读取中分析。
+- 不提供或使用替代数据源模式，如离线本地文件输入、缓存复用、`--use-cache` 或手动 `--refresh` 切换。
+- 将非 draft、非 prerelease 的 release 视为稳定版本。
+- 默认比较最新稳定版本与上一个稳定版本。
+- 仅将比最新稳定版本更新的 beta/prerelease 版本作为前瞻性预览提及。
+- 除非用户明确请求并授权，否则不扫描用户本地项目。
+- 区分事实、推断和不确定性。
+- 每条 release note 都附带解读：影响受众、风险等级、置信度和建议操作。
+- 除非有公开 surface 变更的证据，否则不要断言内部重构会影响开发者。
 
-## File Locations (Snapshots vs. Reports)
+## 文件位置（Snapshots vs. Reports）
 
-**Intermediate Artifacts (snapshots, LLM prompts, base analysis):**
-- All intermediate files are stored in the **platform cache directory**:
-  - **Windows**: `%LOCALAPPDATA%\openclaw-release-analyzer\snapshots`
-  - **Linux/macOS**: `~/.cache/openclaw-release-analyzer/snapshots`
-- **Never** written into the skill installation directory. If `--snapshot-dir` points inside the skill directory, the script automatically falls back to the platform cache directory.
-- Intermediate artifact types and lifecycle:
-  - `*-release-notes.md`: Raw GitHub API snapshot. Retains the most recent 20 versions to avoid repeated API fetches.
-  - `*-analysis-data.json`: Master analysis data for LLM (release notes + commits + diff stats). Step-internal, cleaned after report generation.
-  - `*-base-analysis.json`: Rule-based analysis results (step-internal, cleaned after report generation).
-  - `*-llm-results.json`: LLM analysis results (retained for 7 days to allow re-running report generation).
-- **Automatic cache consistency verification** (Optimization #7 — Cache Auto-Consistency Check):
-  - Every time a cached snapshot is loaded, the script runs a multi-layer consistency check **before** using the data.
-  - **Structure integrity**: Verifies frontmatter has all required fields (`repo`, `target_version`, `fetched_at`, `scoped_releases`, `release_payload_base64`, etc.) and body contains sections for each scoped release.
-  - **Payload consistency**: Verifies `release_payload_base64` decodes correctly, contains all scoped releases, and the target version is present.
-  - **Freshness check**: Compares cached data against live GitHub API data — detects if a newer stable release is available (in `--latest` mode), if the target version no longer exists, or if `published_at` has changed (indicating the release was edited).
-  - **LLM results consistency**: Before applying cached `llm-results.json`, verifies the file is valid JSON, not older than its associated snapshot, and references versions that exist in the snapshot.
-  - If any **error-level** check fails, the script automatically discards the inconsistent cache and re-fetches from GitHub. **Warning-level** issues (e.g., snapshot older than 7 days) are reported to stderr but do not block cache usage.
-- Snapshots are **not the final deliverable** and can be safely deleted at any time.
-- Use `--clean-cache` for manual one-shot cleanup.
+**中间产物（snapshots、LLM prompts、基础分析）：**
+- 所有中间文件存储在**平台缓存目录**：
+  - **Windows**：`%LOCALAPPDATA%\openclaw-release-analyzer\snapshots`
+  - **Linux/macOS**：`~/.cache/openclaw-release-analyzer/snapshots`
+- **绝不**写入 skill 安装目录。如果 `--snapshot-dir` 指向 skill 目录内部，脚本自动回退到平台缓存目录。
+- 中间产物类型和生命周期：
+  - `*-release-notes.md`：原始 GitHub API snapshot。保留最近 20 个版本以避免重复 API 获取。
+  - `*-analysis-data.json`：LLM 主分析数据（release notes + commits + diff stats）。步骤内部文件，报告生成后清理。
+  - `*-base-analysis.json`：规则分析结果（步骤内部文件，报告生成后清理）。
+  - `*-llm-results.json`：LLM 分析结果（保留 7 天以支持重新生成报告）。
+- **自动缓存一致性验证**（Optimization #7 — 缓存自动一致性检查）：
+  - 每次加载缓存 snapshot 时，脚本在使用数据前运行多层一致性检查。
+  - **结构完整性**：验证 frontmatter 包含所有必需字段（`repo`、`target_version`、`fetched_at`、`scoped_releases`、`release_payload_base64` 等），且正文包含每个 scoped release 的章节。
+  - **Payload 一致性**：验证 `release_payload_base64` 正确解码、包含所有 scoped releases，且目标版本存在。
+  - **时效性检查**：将缓存数据与实时 GitHub API 数据对比——检测是否有更新的稳定版本可用（`--latest` 模式下）、目标版本是否已不存在，或 `published_at` 是否已变更（表明 release 被编辑过）。
+  - **LLM 结果一致性**：在应用缓存的 `llm-results.json` 前，验证文件为有效 JSON、不早于其关联 snapshot，且引用的版本存在于 snapshot 中。
+  - 如果任何 **error 级别**检查失败，脚本自动丢弃不一致的缓存并从 GitHub 重新获取。**Warning 级别**问题（例如 snapshot 超过 7 天）报告到 stderr 但不阻止缓存使用。
+- Snapshots**不是最终交付物**，可随时安全删除。
+- 使用 `--clean-cache` 进行手动一次性清理。
 
-**Analysis Reports (final deliverable):**
-- If the user specifies an output path (e.g. "输出到 /path/to/report.md"), pass it via `--output <path>`.
-- **If the user does NOT specify an output path**, the report defaults to the **current working directory** with the filename `{snapshot_stem}-analysis.md` (e.g. `openclaw-openclaw-v1.3.0-release-notes-analysis.md`).
-- Before running the script, `cd` into the user's current workspace directory so the report lands there by default.
-- **After the analysis completes, you MUST clearly tell the user BOTH: (1) the absolute file path of the generated report, AND (2) the snapshot cache directory where intermediate data was written.** Use a table format for clarity:
+**分析报告（最终交付物）：**
+- 如果用户指定了输出路径（例如 "输出到 /path/to/report.md"），通过 `--output <path>` 传入。
+- **如果用户没有指定输出路径**，报告默认写入**当前工作目录**，文件名为 `{snapshot_stem}-analysis.md`（例如 `openclaw-openclaw-v1.3.0-release-notes-analysis.md`）。
+- 运行脚本前，`cd` 到用户当前工作区目录，使报告默认落在那里。
+- **分析完成后，你必须清楚告知用户两件事：(1) 生成报告的绝对文件路径，以及 (2) 中间数据写入的 snapshot 缓存目录。** 使用表格格式以清晰展示：
 
 ```
 | 类型 | 路径 |
 |------|------|
-| 最终报告 (Report) | <absolute-path-to-report> |
-| 中间缓存 (Snapshot) | <platform-cache-dir> |
+| 最终报告 | <absolute-path-to-report> |
+| 中间缓存 | <platform-cache-dir> |
 ```
 
-## Workflow
+## 工作流程
 
-### 1. Detect Output Language
+### 1. 输出语言
 
-Detect the user's language from the input request:
+本 Skill 固定生成中文报告，技术专有名词保持英文。
 
-- If the request contains Chinese characters or is predominantly in Chinese, generate the report in Chinese.
-- Otherwise, generate the report in English.
-- Technical proper nouns (API, SDK, CLI, plugin, hook, manifest, release note, etc.) are always kept in English regardless of language mode.
+`--lang` 参数已废弃，保留仅用于向后兼容，实际输出始终为中文。
 
-Pass the detected language to the script via `--lang en` or `--lang zh`.
+### 2. 确定分析范围
 
-### 2. Resolve Analysis Scope
+根据用户请求确定分析范围：
 
-Identify the intended scope from the user request:
+- 最新稳定版分析：未提供版本号。
+- 单目标版本：用户提及一个版本。
+- 版本对比：用户提及两个版本，例如 `v1.2.3` 到 `v1.3.0`。
+- 版本范围：起始/终止版本或范围表达式。
+- Beta 预览：用户明确询问 beta、alpha、rc、prerelease 或 preview 版本。
+- 项目级兼容分析：仅当用户明确要求检查本地项目时。
 
-- Latest stable analysis: no version provided.
-- Single target version: one version mentioned.
-- Version comparison: two versions mentioned, such as `v1.2.3` to `v1.3.0`.
-- Version range: from/to versions or a range expression.
-- Beta preview: user explicitly asks about beta, alpha, rc, prerelease, or preview versions.
-- Project-aware compatibility analysis: only when the user explicitly asks to inspect a project.
+### 3. GitHub Token 验证（任何 API 调用之前）
 
-### 3. GitHub Token Verification (Before Any API Call)
+脚本在每次运行时自动验证 GitHub token，**在任何 API 请求之前**：
 
-The script automatically verifies the GitHub token on every run, **before** making any API requests:
+1. **Token 解析顺序**：`--github-token` CLI 参数 → `GITHUB_TOKEN` 环境变量 → 无。
+2. **Token 验证**：调用 `GET /rate_limit` 验证 token 是否有效且未过期。
+3. **Token 有效**（stderr 输出 `TOKEN_STATUS: valid`）：
+   - 脚本以 **完整 LLM 增强 diff 分析** 作为默认模式继续运行。
+   - 在默认模式（Mode C）下，脚本自动生成 LLM prompt 并发出就绪信号（`LLM_PROMPTS_READY: N`），然后退出，由调用方 AI agent 执行 LLM 分析步骤。
+4. **Token 无效或缺失**（stderr 输出 `TOKEN_STATUS: invalid`）：
+   - 向 stderr 打印错误信息。
+   - **立即报错退出，不生成任何报告**。LLM 增强分析是强制要求，不允许无 token 运行。
 
-1. **Token resolution order**: `--github-token` CLI argument → `GITHUB_TOKEN` environment variable → none.
-2. **Token validation**: calls `GET /rate_limit` to verify the token is active and not expired.
-3. **If token is valid** (`TOKEN_STATUS: valid` printed to stderr):
-   - The script proceeds with **full LLM-enhanced diff analysis** as the default mode.
-   - In default mode (Mode C), it automatically generates LLM prompts and signals readiness (`LLM_PROMPTS_READY: N`), then exits so the invoking AI agent can perform the LLM analysis step.
-4. **If token is invalid or missing** (`TOKEN_STATUS: invalid` printed to stderr):
-   - A language-adaptive warning is printed to stderr explaining that only rule-based analysis will be performed and results may be less accurate.
-   - `--no-llm` is automatically forced.
-   - The report's `data_source` field is set to "rule-based only" for transparency.
+如果用户提供的 token 验证失败，告知用户 token 无效，并要求提供有效的 GitHub token 后再重新执行分析。不提供"继续仅规则分析"的选项。
 
-If the user explicitly provides a token that fails validation, tell them the token is invalid and ask whether to continue with rule-based-only analysis or provide a corrected token.
+### 4. 分析前刷新 Snapshot
 
-### 4. Refresh Snapshot Before Analysis
+每次运行使用固定的数据流：
 
-Use one fixed data flow for every run:
+1. 从 GitHub Releases API 获取最新匹配的 release metadata 和 release notes。
+2. 将获取的数据写入本地 snapshot，存储在**平台缓存目录**：
+   - **Windows**：`%LOCALAPPDATA%\openclaw-release-analyzer\snapshots`
+   - **Linux/macOS**：`~/.cache/openclaw-release-analyzer/snapshots`
+   - 仅在明确需要时通过 `--snapshot-dir` 覆盖。
+3. 从磁盘重新加载 snapshot。
+4. **验证缓存一致性**（自动执行，无需用户操作）。在使用任何缓存 snapshot 或 LLM 结果之前，脚本会执行结构完整性、payload 一致性、时效性和 LLM 结果对齐检查。如果任何检查以 error 级别失败，缓存文件将被丢弃并自动重新获取数据。
+5. 仅基于验证通过的 snapshot 内容生成分析报告。
 
-1. Fetch the latest matching release metadata and release notes from GitHub Releases API.
-2. Write the fetched data to a local snapshot in the **platform cache directory**:
-   - **Windows**: `%LOCALAPPDATA%\openclaw-release-analyzer\snapshots`
-   - **Linux/macOS**: `~/.cache/openclaw-release-analyzer/snapshots`
-   - Override with `--snapshot-dir` only if explicitly needed.
-3. Load the snapshot back from disk.
-4. **Verify cache consistency** (automatic, no user action required). Before using any cached snapshot or LLM results, the script performs structure integrity, payload consistency, freshness, and LLM results alignment checks. If any check fails with an error, the cached file is discarded and fresh data is fetched automatically.
-5. Generate the analysis report from the verified snapshot content only.
+Snapshots 是中间缓存数据——它们存放在系统缓存目录中，可随时安全删除。**Snapshots 不是最终交付物。** 分析报告是用户唯一关心的文件。
 
-Snapshots are intermediate cache data — they live in the system cache directory and can be safely deleted. **Snapshots are NOT the final deliverable.** The analysis report is the only file the user cares about.
+**报告输出位置规则：**
+- 如果用户指定了输出路径 → 通过 `--output <path>` 传入。
+- 如果用户**没有**指定输出路径 → **不要传入 `--output`**；脚本自动将报告写入当前工作目录（`Path.cwd()` / `{snapshot_stem}-analysis.md`）。
+- **始终先 `cd` 到用户当前工作区根目录再运行脚本**，使默认输出落在工作区目录，而非 skill 目录或 `snapshots/` 子目录。
 
-**Report output location rules:**
-- If the user specifies an output path → pass it via `--output <path>`.
-- If the user does NOT specify an output path → **DO NOT pass `--output`**; the script automatically writes the report to the current working directory (`Path.cwd()` / `{snapshot_stem}-analysis.md`).
-- **ALWAYS `cd` into the user's current workspace root before running the script**, so the default output lands in the workspace directory, not in the skill directory or a `snapshots/` subdirectory.
+除非用户明确要求项目级兼容检查，否则保持分析范围以 release note 为主。不要引入离线文件、缓存复用或多数据源选择模式。
 
-Keep the analysis scope as release-note based unless the user explicitly asks for project-aware compatibility inspection. Do not introduce offline-file, cache-reuse, or multiple source-selection modes.
+### 5. LLM Commit-Message Bridge 分析（Token 依赖的默认模式）
 
-### 5. LLM-Powered Commit-Message Bridge Analysis (Token-Dependent Default)
+当有效的 GitHub token 可用且存在 compare baseline（例如 `--compare v1.2.3 --target v1.3.0`）时，脚本**自动**使用 **commit-message-bridge** 方法增强分析。该方法修复了旧的按组件路径匹配策略的根本缺陷（该策略为每个组都生成了无关的 `.gitignore`/`.npmrc` diff），通过向 LLM 提供：
 
-When a valid GitHub token is available and a compare baseline exists (e.g., `--compare v1.2.3 --target v1.3.0`), the script **automatically** enhances the analysis with a **commit-message-bridge** approach. This approach fixes the fundamental flaw of the old per-component path-matching strategy (which produced irrelevant `.gitignore`/`.npmrc` diffs for every group) by giving the LLM:
+- **所有 release notes**（含规则预分类）
+- **版本间的所有 commits**（含提交消息和变更文件路径）
+- **目录级代码变更统计**（非原始 patch 转储）
 
-- **All release notes** (with rule-based pre-classification)
-- **All commits between versions** (with messages and changed file paths)
-- **Directory-level code change statistics** (not raw patch dumps)
+然后 LLM 使用 commit message 作为自然桥梁，在 release notes 和 commits 之间执行**语义关联**——这是只有 LLM 才能准确完成的任务。
 
-The LLM then performs **semantic association** between release notes and commits using commit messages as the natural bridge — a task only an LLM can do accurately.
+**LLM 分析是强制步骤，不可跳过**。即使 trivial release 也必须经过 LLM 分析，以确保分析质量的一致性。
 
-**When the token is missing or invalid, this step is skipped entirely** and only rule-based analysis is performed. The final report clearly states "rule-based only" in the data source field.
+**为什么选择 commit-message bridge 而非路径匹配 diff？**
 
-**Why commit-message bridge instead of path-matched diffs?**
+| 旧方法 | Commit-message bridge |
+|--------|----------------------|
+| 脚本决定 "Plugin 组 → plugins/ 目录文件" | LLM 读取 commit message 并自行决定关联 |
+| 27 个独立 prompt，每个带 2-5 个文件 | 单个综合 prompt，包含所有 commits + notes |
+| 所有组都收到 `.gitignore`、`.npmrc`（无关） | Commits 按相关性评分；noise 文件被降级 |
+| LLM 被迫将 `.gitignore` 变更解释为 plugin API 证据 | LLM 可以诚实地说 "此 note 没有匹配的 commit" |
+| 无跨 note 交叉验证 | LLM 看到所有 notes + 所有 commits，可检测 shadow changes |
 
-| Old approach | Commit-message bridge |
-|-------------|----------------------|
-| Script decides "Plugin group → plugins/ directory files" | LLM reads commit messages and decides association |
-| 27 independent prompts, each with 2–5 files | Single comprehensive prompt with all commits + notes |
-| All groups received `.gitignore`, `.npmrc` (irrelevant) | Commits scored by relevance; noise files penalized |
-| LLM forced to interpret `.gitignore` changes as plugin API evidence | LLM can say "this note has no matching commit" honestly |
-| No cross-note cross-validation | LLM sees all notes + all commits, detects shadow changes |
+**Token 控制策略：**
+- Commits 通过消息关键词模式（plugin、API、security、breaking 等）和文件路径信号**按相关性评分**
+- 仅触及 noise 文件（`.gitignore`、docs、CI configs）的 commits **被降级和去优先**
+- 包含评分最高的 commits（最多 80 个）；总分析数据上限约 120K 字符
+- 默认不需要外部 LLM SDK——LLM 分析由调用方 AI agent（如 Claude Code）使用生成的分析数据执行。或者，脚本可以扩展内置 LLM API 客户端以支持独立运行。
 
-**Token-control strategy:**
-- Commits are **scored by relevance** using message keyword patterns (plugin, API, security, breaking, etc.) and file-path signals
-- Commits touching only noise files (`.gitignore`, docs, CI configs) are **penalized and deprioritized**
-- Top-scored commits (up to 80) are included; total analysis data is capped at ~120K characters
-- No external LLM SDK is required by default — the LLM analysis is performed by the invoking AI agent (e.g., Claude Code) using the generated analysis data. Alternatively, the script can be extended with a built-in LLM API client for standalone execution.
+**LLM 分析执行策略：**
 
-**LLM analysis execution strategy:**
+- **单次综合分析（默认）。** 读取 `analysis-data.json` 文件一次，在单个 prompt 中喂给 LLM，收集结构化 JSON 输出。这让 LLM 获得全局上下文以进行跨 note 验证和 shadow-change 检测。
+- **自动分块分析（大型 release）。** 当分析数据超过 token 阈值（约 80K tokens）时，脚本**自动拆分**为 chunks。分析处理器（AI agent 或内置客户端）逐块处理，然后脚本**自动合并**结果。处理器**不决定**拆分策略——脚本决定。
+- **禁止：** 引入外部 LLM SDK、产生生命周期超过 skill 调用的未跟踪后台进程、在非指定缓存目录外写入中间文件、要求用户提供 API key、或手动编写 Python 脚本伪造 LLM 结果。
 
-- **Single comprehensive analysis (default).** Read the `analysis-data.json` file once, feed it to the LLM in one prompt, collect the structured JSON output. This gives the LLM global context for cross-note validation and shadow-change detection.
-- **Automatic chunked analysis (large releases).** When the analysis data exceeds the token threshold (~80K tokens), the script **automatically splits** it into chunks. The analysis processor (AI agent or built-in client) processes each chunk, then the script **automatically merges** results. The processor does NOT decide the split strategy — the script does.
-- **Prohibited:** Introducing external LLM SDKs, spawning untracked background processes that outlive the skill invocation, writing intermediate artifacts outside the designated cache directory, requiring user-provided API keys, or manually writing Python scripts to generate fake LLM results.
+**工作流：**
 
-**Workflow:**
-
-1. **Prepare Analysis Data** — Run the script in data-preparation mode. It fetches release notes, rule-based analyses, commits, and diff statistics, then writes a single master data file:
+1. **准备分析数据** — 以数据准备模式运行脚本。它获取 release notes、规则分析结果、commits 和 diff 统计，然后写入一个主数据文件：
    ```bash
    cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --target v1.3.0 --compare v1.2.3 --prepare-analysis-data --lang zh
    ```
-   The script outputs one of two signal patterns:
+   脚本输出两种信号模式之一：
 
-   **Pattern A — Single chunk (small/medium release):**
+   **模式 A — 单 chunk（小型/中型 release）：**
    ```
    ANALYSIS_DATA_READY: 1
    DATA: <snapshot-dir>/<repo>-<target>-analysis-data.json
@@ -188,7 +183,7 @@ The LLM then performs **semantic association** between release notes and commits
    ESTIMATED_TOKENS: 45000
    ```
 
-   **Pattern B — Multiple chunks (large release, >80K tokens):**
+   **模式 B — 多 chunks（大型 release，>80K tokens）：**
    ```
    ANALYSIS_DATA_READY: 1
    DATA: <snapshot-dir>/<repo>-<target>-analysis-data.json
@@ -202,23 +197,23 @@ The LLM then performs **semantic association** between release notes and commits
    MERGE_COMMAND: --merge-chunk-results
    ```
 
-   When you see **CHUNKING_REQUIRED: 1**, proceed to Step 2b (chunked analysis). Otherwise, proceed to Step 2a (single analysis).
+   当看到 **CHUNKING_REQUIRED: 1** 时，跳到步骤 2b（分块分析）。否则跳到步骤 2a（单块分析）。
 
-   The `analysis-data.json` contains three sections:
-   - `release_notes`: All notes with IDs, raw text, and `source_version` (the release tag this note originates from, e.g. `v2026.4.12`). When analyzing a version range, `source_version` enables the LLM to identify which intermediate version introduced each change, detect progressive fixes across versions, and reason about upgrade path dependencies.
-   - `commits`: Top relevant commits (sha, message, author, changed files, relevance score)
-   - `code_changes`: Directory-level stats + top changed files (no raw patches)
+   `analysis-data.json` 包含三个部分：
+   - `release_notes`：所有 notes，含 ID、原始文本和 `source_version`（该 note 来源的 release tag，例如 `v2026.4.12`）。分析版本范围时，`source_version` 让 LLM 能识别每个变更由哪个中间版本引入、检测跨版本的渐进式修复，并推理升级路径依赖。
+   - `commits`：评分最高的相关 commits（sha、message、author、changed files、relevance score）
+   - `code_changes`：目录级统计 + 变更最多的文件（不含原始 patches）
 
-2a. **Perform LLM Analysis (single chunk)** — Read the `analysis-data.json` and feed it to the LLM in a single prompt. The prompt instructs the LLM to work in three phases:
-   - **Phase 1 — Thematic Clustering**: Group release notes into 8–15 semantic themes by functional intent. Each theme gets: theme name, involved note IDs, overall risk, summary, impact, related commits, affected files, and reasoning.
-   - **Phase 2 — Cross-Version Analysis** (when `source_version` spans multiple releases):
-     - **Progressive Fix Detection (Optimization #3)**: Identify bug/issue fix chains that span multiple versions — e.g., v1 introduces a temporary mitigation, v2 provides a partial fix, v3 completes the fix. Output each chain with stages (note_id, source_version, fix_description, completeness) and final status.
-     - **Cumulative Breaking Change Analysis (Optimization #4)**: Assess whether individual versions appear low-risk but the aggregate impact across the upgrade path is high. Output `individual_risk` vs `cumulative_risk` with a concrete `risk_escalation_reason` explaining why crossing multiple versions at once is more dangerous than upgrading step-by-step.
-     - **Version Range Annotation**: Identify which intermediate version introduced each theme and annotate version-range dependencies in theme reasoning.
-   - **Phase 3 — Selective Per-Note Enhancement**: Only high-risk notes or notes with direct commit matches receive deep per-note analysis.
-   - **Phase 4 — Shadow Change Detection**: Identify commits that modify public surfaces but have no corresponding release note.
+2a. **执行 LLM 分析（单 chunk）** — 读取 `analysis-data.json` 并在单个 prompt 中喂给 LLM。Prompt 指示 LLM 分四个阶段工作：
+   - **Phase 1 — 主题聚类**：按功能意图将 release notes 分组成 8–15 个语义主题。每个主题包含：主题名称、涉及的 note ID、整体风险、摘要、影响、相关 commits、受影响文件和推理依据。
+   - **Phase 2 — 跨版本分析**（当 `source_version` 跨越多个 release 时）：
+     - **渐进式修复检测（Optimization #3）**：识别跨越多个版本的 bug/issue 修复链——例如 v1 引入临时缓解、v2 提供部分修复、v3 完成修复。输出每条链的阶段（note_id、source_version、fix_description、completeness）和最终状态。
+     - **累积 Breaking Change 分析（Optimization #4）**：评估单个版本看似低风险，但整个升级路径的累积影响是否很高。输出 `individual_risk` 与 `cumulative_risk` 对比，并给出具体的 `risk_escalation_reason`，解释为什么一次性跨多个版本升级比逐步升级更危险。
+     - **版本范围标注**：识别每个主题由哪个中间版本引入，并在主题推理中标注版本范围依赖。
+   - **Phase 3 — 选择性逐条增强**：仅对高风险 note 或有直接 commit 匹配的 note 进行深度逐条分析。
+   - **Phase 4 — Shadow Change 检测**：识别修改了公开 surface 但没有对应 release note 的 commits。
 
-   Request structured output (JSON object with top-level fields):
+   请求结构化输出（JSON 对象，顶层字段如下）：
 
 
    ```json
@@ -291,184 +286,184 @@ The LLM then performs **semantic association** between release notes and commits
    }
    ```
 
-   Theme fields:
+   Theme 字段：
    - `theme_id`: T-01, T-02, ...
-   - `theme_name`: Concise functional theme name (within 15 words), not vague like "Other Changes"
-   - `note_ids`: Note IDs belonging to this theme
-   - `primary_category`: Main category (breaking/security/plugin/api_sdk/cli/config/dependency/performance/fix/feature/docs/other)
-   - `risk_level`: Overall theme risk (high/medium/low)
-   - `summary`: What was done (within 50 words)
-   - `impact`: What it means for users (within 50 words)
-   - `related_commits`: Commit SHAs directly corresponding to this theme (max 3)
-   - `affected_files`: Key file paths involved (max 5)
-   - `confidence`: high=direct commit evidence; medium=indirect inference; low=speculation
-   - `has_hidden_breaking`: Boolean — true **only** if commit evidence reveals a breaking change the notes did **not** disclose
-   - `hidden_risks`: String — specific description of hidden risks, or empty `""` if none
-   - `reasoning`: Judgment rationale — must quote specific commit message snippets and file paths
+   - `theme_name`: 简洁的功能主题名（15 字以内），避免模糊的如 "Other Changes"
+   - `note_ids`: 属于该主题的 Note ID 列表
+   - `primary_category`: 主类别（breaking/security/plugin/api_sdk/cli/config/dependency/performance/fix/feature/docs/other）
+   - `risk_level`: 整体主题风险（high/medium/low）
+   - `summary`: 做了什么（50 字以内）
+   - `impact`: 对用户意味着什么（50 字以内）
+   - `related_commits`: 直接对应此主题的 Commit SHA（最多 3 个）
+   - `affected_files`: 涉及的关键文件路径（最多 5 个）
+   - `confidence`: high=直接 commit 证据；medium=间接推断；low=推测
+   - `has_hidden_breaking`: 布尔值 — 仅当 commit 证据揭示出 release notes **未披露**的 breaking change 时为 true
+   - `hidden_risks`: 字符串 — hidden risks 的具体描述，如无则填 `""`
+   - `reasoning`: 判断依据 — 必须引用具体的 commit message 片段和文件路径
 
-   Detailed note fields (only for high-risk or commit-matched notes):
-   - `note_id`, `component`, `categories`, `risk_level`, `interpretation`, `action_items`, `audience`, `matched_commits`, `affected_files`, `has_hidden_breaking`, `reasoning`
-   - `interpretation` must answer: WHAT changed, WHAT is the impact, WHAT to do about it. NO templates.
+   Detailed note 字段（仅针对高风险或有 commit 匹配的 notes）：
+   - `note_id`、`component`、`categories`、`risk_level`、`interpretation`、`action_items`、`audience`、`matched_commits`、`affected_files`、`has_hidden_breaking`、`reasoning`
+   - `interpretation` 必须回答：WHAT changed, WHAT is the impact, WHAT to do about it。不使用模板。
 
-   Shadow changes fields:
-   - `description`: What undocumented change was found
-   - `evidence_commits`: Commit SHAs supporting this finding
+   Shadow changes 字段：
+   - `description`: 发现的无文档记录的变更描述
+   - `evidence_commits`: 支持此发现的 Commit SHA 列表
 
-2b. **Perform LLM Analysis (chunked — large releases)** — When `CHUNKING_REQUIRED: 1` is signaled, process each chunk in sequence:
+2b. **执行 LLM 分析（分块 — 大型 release）** — 当信号显示 `CHUNKING_REQUIRED: 1` 时，依次处理每个 chunk：
 
-   For each chunk file (e.g., `chunk-000.json`, `chunk-001.json`, ...):
-   - Read the chunk file
-   - Feed it to the LLM with the same four-phase prompt
-   - Save the LLM output to the corresponding chunk result file:
+   对每个 chunk 文件（例如 `chunk-000.json`、`chunk-001.json`、...）：
+   - 读取 chunk 文件
+   - 用同样的四阶段 prompt 喂给 LLM
+   - 将 LLM 输出保存到对应的 chunk 结果文件：
      ```
      <snapshot-dir>/<repo>-<target>-llm-results-chunk-000.json
      <snapshot-dir>/<repo>-<target>-llm-results-chunk-001.json
      ...
      ```
 
-   Each chunk result contains only `themes` and `detailed_notes` (plus any `compatibility_risks`/`test_points`/`shadow_changes` found in that chunk). The script's merge step synthesizes the final `executive_summary` and `developer_conclusion`.
+   每个 chunk 结果仅包含 `themes` 和 `detailed_notes`（以及该 chunk 中发现的任何 `compatibility_risks`/`test_points`/`shadow_changes`）。脚本的合并步骤合成最终的 `executive_summary` 和 `developer_conclusion`。
 
-   **Do NOT ask the user whether to use chunks.** The script has already decided. Your role is to execute the chunk-by-chunk analysis exactly as the script has split it.
+   **不要询问用户是否使用分块。** 脚本已经决定了。你的角色是按脚本拆分的方式逐块执行分析。
 
-3a. **Write LLM Results (single chunk)** — Save the LLM output to:
+3a. **写入 LLM 结果（单 chunk）** — 将 LLM 输出保存到：
    ```
    <snapshot-dir>/<repo>-<target>-llm-results.json
    ```
 
-3b. **Merge Chunk Results (chunked)** — After all chunks are processed, run:
+3b. **合并 Chunk 结果（分块）** — 所有 chunks 处理完成后，运行：
    ```bash
    cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --target v1.3.0 --compare v1.2.3 --merge-chunk-results --lang zh
    ```
-   The script discovers all `*-llm-results-chunk-*.json` files, merges them by:
-   - Unioning `theme.note_ids` per `theme_id`
-   - Deduplicating `detailed_notes` by `note_id`
-   - Merging `compatibility_risks`, `test_points`, `shadow_changes` (dedup by description)
-   - Synthesizing `executive_summary` from merged themes
-   - Writing the final result to:
+   脚本发现所有 `*-llm-results-chunk-*.json` 文件，通过以下方式合并：
+   - 按 `theme_id` 合并 `theme.note_ids`
+   - 按 `note_id` 去重 `detailed_notes`
+   - 合并 `compatibility_risks`、`test_points`、`shadow_changes`（按 description 去重）
+   - 从合并后的 themes 合成 `executive_summary`
+   - 将最终结果写入：
      ```
      <snapshot-dir>/<repo>-<target>-llm-results.json
      ```
 
-4. **Generate Enhanced Report** — Run the script with the LLM results:
+4. **生成增强报告** — 使用 LLM 结果运行脚本：
    ```bash
    cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --target v1.3.0 --compare v1.2.3 --apply-llm-results "<snapshot-dir>/<repo>-<target>-llm-results.json" --lang zh
    ```
-   The script reuses the cached snapshot and base analysis from Step 1 — **no repeated GitHub API calls**.
+   脚本复用步骤 1 的缓存 snapshot 和基础分析 — **无需重复 GitHub API 调用**。
 
-   **Cache cleanup** happens automatically after the final report is generated: step-internal files (`*-analysis-data.json`, `*-base-analysis.json`, `*-analysis-chunk-*.json`) are removed immediately. The script also performs a lazy cleanup on every startup: `*-llm-results.json` files older than 7 days are purged, and only the most recent 20 `*-release-notes.md` snapshots are retained.
+   **缓存清理**在最终报告生成后自动进行：步骤内部文件（`*-analysis-data.json`、`*-base-analysis.json`、`*-analysis-chunk-*.json`）被立即删除。脚本还在每次启动时执行惰性清理：删除超过 7 天的 `*-llm-results.json` 文件，且仅保留最近 20 个 `*-release-notes.md` snapshot。
 
-**Fallback**: If LLM analysis is unavailable, fails, or `--no-llm` is specified, the script automatically falls back to rule-based analysis. The report structure remains identical regardless of analysis mode.
+**强制 LLM 分析**：LLM 分析是本 Skill 的必需步骤，不可跳过、不可回退。如果 LLM 分析失败或 chunk 结果不完整，必须修复问题后重新执行，不允许输出无 LLM 增强的报告。
 
-**Default mode shortcut**: If an `llm-results.json` file already exists in the snapshot directory from a previous run, the default command (`--target ... --compare ...`) automatically detects and applies it without requiring `--apply-llm-results`. Before applying cached LLM results, the script verifies their consistency with the associated snapshot (valid JSON, not older than snapshot). If the consistency check fails, the cached results are discarded and fresh analysis data is prepared.
+**默认模式快捷方式**：如果 snapshot 目录中已存在上次运行留下的 `llm-results.json` 文件，默认命令（`--target ... --compare ...`）会自动检测并应用它，无需 `--apply-llm-results`。在应用缓存的 LLM 结果之前，脚本验证其与关联 snapshot 的一致性（有效 JSON、不早于 snapshot）。如果一致性检查失败，缓存结果将被丢弃并准备新的分析数据。
 
-**LLM-Driven Report Architecture**: In the new architecture, the script is a data pipeline and the LLM performs ALL semantic analysis. The script does not merge LLM results with rule-based templates. Instead, the LLM outputs complete report sections (executive summary, themes, detailed notes, compatibility risks, test points, shadow changes), and the script renders them directly. This eliminates template bias and maximizes analysis depth.
+**LLM 驱动的报告架构**：在新架构中，脚本是数据管道，LLM 执行所有语义分析。脚本不会将 LLM 结果与规则模板合并。相反，LLM 输出完整的报告章节（executive summary、themes、detailed notes、compatibility risks、test points、shadow changes），脚本直接渲染它们。这消除了模板偏见并最大化分析深度。
 
-When `--no-llm` is specified or no valid token is available, the script falls back to the legacy rule-based analysis mode (keyword matching + template filling). The report structure is identical in both modes, but the LLM mode produces significantly more accurate and insightful content.
+**禁止规则分析回退**：本 Skill 不允许以任何理由回退到无 LLM 增强的规则分析模式。无论 release 大小、token 状态或任何其他条件，LLM 分析都是强制要求。
 
-**Version-Size-Aware LLM Skipping**: When a valid token is available, the script may skip LLM analysis for trivial releases (<10 items, zero high-risk signals, no breaking/security/plugin/API/dependency changes) to avoid unnecessary LLM overhead. Use `--no-llm` to forcefully disable LLM even when a valid token is present.
+**版本大小感知**：当 release 规模较小时，脚本仍准备 LLM 分析数据，但不会进入分块模式。小型 release 的 LLM 分析在单个 prompt 中完成，无需分块。
 
-### 5.1 Large-Context Handling Protocol (大上下文处理协议)
+### 5.1 大上下文处理协议
 
-This protocol defines the standard behavior when analysis data exceeds LLM context limits. **The script makes all splitting and merging decisions; you only execute.**
+本协议定义分析数据超过 LLM 上下文限制时的标准行为。**脚本做出所有拆分和合并决策；你只需执行。**
 
-**Trigger condition:**
-- When `ESTIMATED_TOKENS` exceeds `CHUNKING_THRESHOLD_TOKENS` (80,000), the script automatically enters chunked mode.
-- The script outputs `CHUNKING_REQUIRED: 1` and lists all `CHUNK_N` files.
+**触发条件：**
+- 当 `ESTIMATED_TOKENS` 超过 `CHUNKING_THRESHOLD_TOKENS`（80,000）时，脚本自动进入分块模式。
+- 脚本输出 `CHUNKING_REQUIRED: 1` 并列出所有 `CHUNK_N` 文件。
 
-**Core principle: The main AI agent analyzes each chunk serially.**
+**核心原则：主 AI agent 串行分析每个 chunk。**
 
-Do NOT use sub-agents, background agents, or any parallel execution mechanism for chunk analysis. The main agent reads each chunk, analyzes it, writes the result to disk, and proceeds to the next chunk. This approach is:
-- **Universal**: Works in any AI environment (Claude Code, Cursor, GitHub Copilot Chat, etc.) that supports file I/O.
-- **Reliable**: No data loss from agent-to-agent communication failures.
-- **Context-safe**: Each chunk is analyzed independently; results are persisted to disk and do not accumulate in context.
+不要使用子 agent、后台 agent 或任何并行执行机制进行 chunk 分析。主 agent 读取每个 chunk，分析它，将结果写入磁盘，然后继续下一个 chunk。这种方式：
+- **通用**：适用于任何支持文件 I/O 的 AI 环境（Claude Code、Cursor、GitHub Copilot Chat 等）。
+- **可靠**：不存在 agent 间通信失败导致的数据丢失。
+- **上下文安全**：每个 chunk 独立分析；结果持久化到磁盘，不在上下文中累积。
 
-**Analysis workflow (serial execution):**
+**分析工作流（串行执行）：**
 
-For each chunk file (`chunk-000.json`, `chunk-001.json`, ...):
+对每个 chunk 文件（`chunk-000.json`、`chunk-001.json`、...）：
 
-1. **Read** the chunk file using the `Read` tool.
-2. **Analyze** the chunk data with the LLM using the standard three-phase prompt (thematic clustering, selective per-note enhancement, shadow change detection).
-3. **Write** the complete JSON result to the corresponding chunk result file:
+1. 使用 `Read` 工具**读取** chunk 文件。
+2. 使用标准四阶段 prompt（主题聚类、选择性逐条增强、shadow change 检测）将 chunk 数据**分析**给 LLM。
+3. 将完整 JSON 结果**写入**对应的 chunk 结果文件：
    ```
    <snapshot-dir>/<repo>-<target>-llm-results-chunk-000.json
    <snapshot-dir>/<repo>-<target>-llm-results-chunk-001.json
    ...
    ```
-4. **Verify** the file was written successfully (non-empty, valid JSON).
-5. **Proceed** to the next chunk. Do NOT start multiple chunks simultaneously.
+4. **验证**文件写入成功（非空、有效 JSON）。
+5. **继续**下一个 chunk。不要同时启动多个 chunk。
 
-**Result verification checklist:**
+**结果验证清单：**
 
-After writing each chunk result:
-- The file MUST be non-empty.
-- The file MUST contain valid JSON parseable by `json.loads()`.
-- The JSON MUST contain at least a `themes` array (may be empty if the chunk has no thematically groupable notes).
+写入每个 chunk 结果后：
+- 文件必须非空。
+- 文件必须包含可被 `json.loads()` 解析的有效 JSON。
+- JSON 必须至少包含一个 `themes` 数组（如果该 chunk 没有可主题分组的 notes，可为空）。
 
-**JSON safety rule (CRITICAL):**
+**JSON 安全规则（关键）：**
 
-Before writing a chunk result, ensure all string fields — especially `interpretation`, `reasoning`, `summary`, `impact`, and `hidden_risks` — do NOT contain unescaped double-quote characters (`"` or `"` or `"`). These characters break JSON parsing. Either:
-- Use single quotes or angle quotes (`'...'`, `《...》`) when quoting inside string fields, or
-- Use `json.dumps()` (via a Python script) to guarantee proper escaping.
+写入 chunk 结果前，确保所有字符串字段——特别是 `interpretation`、`reasoning`、`summary`、`impact` 和 `hidden_risks`——不包含未转义的双引号字符（`"` 或 `"` 或 `"`）。这些字符会破坏 JSON 解析。可以：
+- 在字符串字段内引用时使用单引号或角引号（`'...'`、`《...》`），或
+- 使用 `json.dumps()`（通过 Python 脚本）保证正确转义。
 
-**Cache cleanup rule:**
+**缓存清理规则：**
 
-Before starting chunk analysis, check for stale `*-llm-results-chunk-*.json` or `*-llm-results.json` files from previous runs. If the `analysis-data.json` has been refreshed (compare timestamps), **delete old chunk results** to prevent the merge step from mixing stale and fresh data. The script's `--prepare-analysis-data` step does NOT automatically clean old results — you must do this manually or verify freshness.
+开始 chunk 分析前，检查是否存在之前运行遗留的过期 `*-llm-results-chunk-*.json` 或 `*-llm-results.json` 文件。如果 `analysis-data.json` 已刷新（比较时间戳），**删除旧的 chunk 结果**以防止合并步骤混入新旧数据。脚本的 `--prepare-analysis-data` 步骤不会自动清理旧结果——你需要手动执行或验证时效性。
 
-**Chunk inventory:**
+**Chunk 清单：**
 
-Maintain awareness of the expected chunk count (from `CHUNK_COUNT` in the script output) vs. successfully saved chunk files. Do NOT invoke `--merge-chunk-results` until all expected chunk result files exist.
+注意预期的 chunk 数量（来自脚本输出的 `CHUNK_COUNT`）与成功保存的 chunk 文件数量。在所有预期的 chunk 结果文件都存在之前，不要调用 `--merge-chunk-results`。
 
-**Efficiency guidelines:**
+**效率指南：**
 
-To minimize total execution time:
-1. **Do NOT re-read chunk files after writing** — the Edit/Write tool's success guarantees the write succeeded.
-2. **Reuse theme IDs across chunks** — if a theme (e.g., "Codex app-server") appears in multiple chunks, use the same `theme_id` (e.g., "T-07") in all chunks. The merge step unions `note_ids` per `theme_id`, avoiding duplicate themes.
-3. **Skip verbose reasoning for low-risk themes** — for `risk_level: "low"` themes, a 1-sentence `reasoning` is sufficient.
-4. **Validate JSON immediately after Write** — run a `json.loads()` check right after writing each chunk (takes 1 second), rather than discovering the error at merge time (costs minutes of re-analysis).
-5. **If merge fails due to JSON error**: Fix only the broken chunk file and re-run `--merge-chunk-results`. Do NOT re-analyze any chunk.
+为最小化总执行时间：
+1. **写入后不要重新读取 chunk 文件** — Edit/Write 工具的成功保证写入已完成。
+2. **跨 chunks 复用 theme ID** — 如果一个主题（例如 "Codex app-server"）出现在多个 chunks 中，在所有 chunks 中使用相同的 `theme_id`（例如 "T-07"）。合并步骤按 `theme_id` 合并 `note_ids`，避免重复主题。
+3. **对低风险主题省略冗长 reasoning** — 对于 `risk_level: "low"` 的主题，1 句话的 `reasoning` 已足够。
+4. **Write 后立即验证 JSON** — 每个 chunk 写入后立即运行 `json.loads()` 检查（耗时 1 秒），而不是在合并时才发现错误（会浪费数分钟的重新分析时间）。
+5. **如果合并因 JSON 错误失败**：仅修复损坏的 chunk 文件并重新运行 `--merge-chunk-results`。不要重新分析任何 chunk。
 
-**Context safety guarantee:**
+**上下文安全保证：**
 
-- Each chunk analysis is self-contained: the chunk data (~20–40KB JSON) + analysis prompt (~2KB) + output (~10–30KB JSON) fits comfortably within standard context windows.
-- After a chunk result is written to disk, it is no longer needed in context. The main agent proceeds to the next chunk with a clean slate.
-- The `--merge-chunk-results` step is a **pure Python script operation** (JSON parsing, deduplication, union) that does NOT invoke the LLM and consumes zero LLM context.
-- Even with 8 chunks, the total context footprint at any single point remains well under 100KB.
+- 每个 chunk 分析是自包含的：chunk 数据（约 20-40KB JSON）+ 分析 prompt（约 2KB）+ 输出（约 10-30KB JSON）可舒适地放入标准上下文窗口。
+- chunk 结果写入磁盘后，不再需要在上下文中保留。主 agent 以干净的状态继续下一个 chunk。
+- `--merge-chunk-results` 步骤是**纯 Python 脚本操作**（JSON 解析、去重、合并），不调用 LLM，消耗零 LLM 上下文。
+- 即使 8 个 chunks，任何单点的总上下文占用都远低于 100KB。
 
-**Prohibited actions (STRICT):**
-- Do NOT ask the user "should I split this?" or "how many chunks?" — the script has already decided.
-- Do NOT modify the chunk files or write your own splitting logic.
-- Do NOT skip chunks or merge them manually.
-- Do NOT write Python scripts (like `generate_llm_results.py`) to fabricate analysis results.
-- Do NOT modify the JSON field names or data format in chunk results to "make them work."
-- Do NOT invent data when a chunk lacks matching commits — report honestly that no match was found.
-- Do NOT use sub-agents, background agents, or parallel agent calls for chunk analysis.
+**禁止行为（严格，违反任何一条都会导致分析报告失去价值）：**
+- 不要问用户 "要拆分吗？" 或 "多少个 chunks？" — 脚本已经决定了。
+- 不要修改 chunk 文件或编写自己的拆分逻辑。
+- 不要跳过 chunks 或手动合并它们。
+- **绝对禁止**编写 Python 脚本、Bash 脚本或任何其他自动化工具来伪造、模拟或替代 LLM 分析结果。包括但不限于：基于规则生成假 theme、假 detailed_notes、假 compatibility_risks；从 base-analysis.json 直接转换格式冒充 LLM 输出；使用模板填充冒充语义分析。
+- 不要修改 chunk 结果中的 JSON 字段名或数据格式来 "让它们工作"。
+- 当 chunk 缺少匹配的 commits 时，不要编造数据——诚实地报告未找到匹配。
+- 不要使用子 agent、后台 agent 或并行 agent 调用进行 chunk 分析。
 
-**What to do if a problem occurs:**
-- **If a chunk analysis fails** (timeout, error, or returns non-JSON):
-  1. Retry the same chunk **once** (re-read the chunk file and re-analyze).
-  2. If the retry also fails: Report the specific chunk number, the error type, and **stop**. Do NOT proceed with partial chunks.
-  3. **Never** fall back to rule-based analysis for a failed chunk silently. If the user explicitly asks to continue with rule-based fallback, document which chunks were lost in the final report.
-- **If chunk inventory is incomplete** (saved chunk count < `CHUNK_COUNT`):
-  - Do NOT invoke `--merge-chunk-results`. Identify which chunks are missing, retry them, and only proceed when the inventory is complete.
-- **If chunk results have conflicting themes** (same `theme_id` but different `theme_name`): The merge step uses the first encountered name; this is acceptable because `theme_id` is the stable key.
-- **If `--merge-chunk-results` fails**: Report the error with the specific exception and **stop** — do not attempt manual merging.
+**如果出现问题：**
+- **如果 chunk 分析失败**（超时、错误或返回非 JSON）：
+  1. **重试**同一个 chunk 一次（重新读取 chunk 文件并重新分析）。
+  2. 如果重试也失败：报告具体的 chunk 编号、错误类型，然后**停止**。不要继续处理部分 chunks。
+  3. **绝不**对失败的 chunk 默默回退到规则分析或输出无 LLM 增强的报告。**不允许在任何情况下回退到规则分析**。
+- **如果 chunk 清单不完整**（已保存 chunk 数量 < `CHUNK_COUNT`）：
+  - 不要调用 `--merge-chunk-results`。识别缺失的 chunks，重试它们，仅在清单完整后继续。
+- **如果 chunk 结果有冲突的主题**（相同的 `theme_id` 但不同的 `theme_name`）：合并步骤使用第一个遇到的名称；这是可接受的，因为 `theme_id` 是稳定键。
+- **如果 `--merge-chunk-results` 失败**：报告错误及具体异常，然后**停止** — 不要尝试手动合并。
 
-**Post-merge Enhancement Protocol:**
+**合并后增强协议：**
 
-After `--merge-chunk-results` completes, the script automatically evaluates the quality of the merged `llm-results.json` and may signal that enhancement is needed.
+`--merge-chunk-results` 完成后，脚本自动评估合并后的 `llm-results.json` 质量，并可能发出需要增强的信号。
 
-**Merge output signals:**
-- `CHUNK_MERGE_COMPLETE: 1` + `LLM_RESULTS: <path>` → merge succeeded, check for enhancement
-- `ENHANCEMENT_NEEDED: 1` + `ENHANCEMENT_PROMPT: <path>` + `NEEDS_FIELDS: <fields>` → merged results need LLM enhancement
+**合并输出信号：**
+- `CHUNK_MERGE_COMPLETE: 1` + `LLM_RESULTS: <path>` → 合并成功，检查是否需要增强
+- `ENHANCEMENT_NEEDED: 1` + `ENHANCEMENT_PROMPT: <path>` + `NEEDS_FIELDS: <fields>` → 合并结果需要 LLM 增强
 
-**When `ENHANCEMENT_NEEDED: 1` is signaled:**
+**当 `ENHANCEMENT_NEEDED: 1` 发出时：**
 
-1. Read the enhancement prompt file (`*-enhancement-prompt.txt`). It contains:
-   - Summaries of all merged themes (name, risk, category, note count, summary)
-   - High-risk theme details and high-risk detailed note summaries
-   - A list of fields that need enhancement (e.g., `executive_summary.theme`, `developer_conclusion`, `compatibility_risks`, `test_points`)
+1. 读取增强 prompt 文件（`*-enhancement-prompt.txt`）。它包含：
+   - 所有合并主题的摘要（名称、风险、类别、note 数量、摘要）
+   - 高风险主题详情和高风险 detailed note 摘要
+   - 需要增强的字段列表（例如 `executive_summary.theme`、`developer_conclusion`、`compatibility_risks`、`test_points`）
 
-2. Feed the enhancement prompt to the LLM and request a JSON response with only the fields that need enhancement:
+2. 将增强 prompt 喂给 LLM，请求仅包含需要增强的字段的 JSON 响应：
    ```json
    {
      "executive_summary": { "recommendation": "...", "theme": "...", "magnitude": "...", "reason": "...", "top_changes": [...], "one_liner": "..." },
@@ -478,82 +473,79 @@ After `--merge-chunk-results` completes, the script automatically evaluates the 
    }
    ```
 
-3. Read the merged `llm-results.json`, patch the fields that need enhancement with the LLM-generated content, and write it back.
+3. 读取合并后的 `llm-results.json`，用 LLM 生成的内容修补需要增强的字段，然后写回。
 
-4. Invoke `--apply-llm-results` to regenerate the final report with the enhanced content.
+4. 调用 `--apply-llm-results` 用增强后的内容重新生成最终报告。
 
-**When `ENHANCEMENT_NEEDED` is NOT signaled:**
-- The merged results are considered high-quality. Proceed directly to `--apply-llm-results`.
+**当 `ENHANCEMENT_NEEDED` 未发出时：**
+- 合并结果被视为高质量。直接跳到 `--apply-llm-results`。
 
-**Why this approach:**
-- The pure-Python merge step is fast and reliable but cannot synthesize nuanced executive summaries.
-- The enhancement prompt contains only theme/note summaries (not raw data), so the LLM enhancement is a lightweight single-prompt operation (~5K tokens vs. the full analysis at 80K+ tokens).
-- The AI agent decides whether to perform the enhancement based on the script's signal, not by manually inspecting the merged file.
+**为什么采用这种方式：**
+- 纯 Python 合并步骤快速可靠，但无法合成细致的 executive summary。
+- 增强 prompt 仅包含主题/note 摘要（不含原始数据），因此 LLM 增强是轻量级单 prompt 操作（约 5K tokens，对比完整分析的 80K+ tokens）。
+- AI agent 根据脚本的信号决定是否执行增强，而非手动检查合并文件。
 
-**Analysis focus rule (to reduce per-chunk time without losing accuracy):**
+**分析聚焦规则（在不损失准确性的前提下减少每 chunk 时间）：**
 
-Each chunk does NOT need exhaustive per-note analysis. Theme-level analysis (`summary`, `impact`, `reasoning`) already covers "what changed" and "what it means" for every note in the theme. `detailed_notes` should only add depth for notes that genuinely need it.
+每个 chunk 不需要详尽的逐条分析。主题级分析（`summary`、`impact`、`reasoning`）已经覆盖了主题中每条 note 的 "what changed" 和 "what it means"。`detailed_notes` 应仅对真正需要深度的 note 补充信息。
 
-**Signal-driven selection** — output `detailed_notes` ONLY for notes meeting ANY of these criteria:
-1. `risk_level: "high"` (mandatory)
-2. `has_hidden_breaking: true` (mandatory — risk may be underestimated)
-3. `primary_category` is `security` or `breaking` (mandatory — safety-critical regardless of declared risk)
-4. Has direct `matched_commits` AND the commit message provides meaningful evidence (optional, but adds analytical value)
+**信号驱动选择** — 仅对满足以下任一条件的 note 输出 `detailed_notes`：
+1. `risk_level: "high"`（必须）
+2. `has_hidden_breaking: true`（必须 — 风险可能被低估）
+3. `primary_category` 为 `security` 或 `breaking`（必须 — 安全关键，无论声明的风险如何）
+4. 有直接 `matched_commits` 且 commit message 提供了有意义的证据（可选，但增加分析价值）
 
-**What to NEVER skip**: Theme-level analysis must still process ALL notes for clustering and risk assessment. A note that is skipped from `detailed_notes` must still appear in its theme's `note_ids` with an accurate `risk_level` and `has_hidden_breaking` flag.
+**绝不能跳过**：主题级分析仍需处理所有 notes 以进行聚类和风险评估。从 `detailed_notes` 中跳过的 note 仍必须出现在其主题的 `note_ids` 中，并带有准确的 `risk_level` 和 `has_hidden_breaking` 标志。
 
-### 6. Use the Bundled Script for Deterministic Analysis
+### 6. 使用内置脚本进行确定性分析
 
-Use `scripts/analyze_openclaw_release.py` for repeatable release fetching, snapshot writing, snapshot-based classification, per-note interpretation, risk assessment, suggested actions, and bilingual report generation.
+使用 `scripts/analyze_openclaw_release.py` 进行可重复的 release 获取、snapshot 写入、基于 snapshot 的分类、逐条解读、风险评估、建议操作和报告生成。
 
-Every command refreshes the snapshot first and then analyzes that snapshot.
+每个命令都会先刷新 snapshot，然后分析该 snapshot。
 
-Example commands:
+示例命令：
 
 ```bash
-# CRITICAL: Always cd into the user's workspace directory first
+# 关键：始终先 cd 到用户的工作区目录
 cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" <args>
 
-# Provide GitHub token (required for LLM-enhanced commit analysis)
-# Option A: via CLI argument
+# 提供 GitHub token（LLM 增强 commit 分析必需）
+# 选项 A：通过 CLI 参数
 cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --latest --lang zh --github-token <token>
-# Option B: via environment variable
+# 选项 B：通过环境变量
 export GITHUB_TOKEN=<token>
 cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --latest --lang zh
 
-# Default: latest stable release, auto-detect language, report lands in CWD
-# When token is valid → auto LLM-enhanced analysis (commit-message-bridge)
-# When token is missing → rule-based analysis with warning
-cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --latest --lang auto --user-query "帮我分析最新版本"
+# 默认：最新稳定版，输出中文报告，报告写入当前工作目录
+# Token 有效 → 自动 LLM 增强分析（commit-message-bridge）
+# Token 缺失 → 规则分析并发出警告
+cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --latest --lang zh --user-query "帮我分析最新版本"
 
-# With explicit output path (only when user specifies one)
+# 显式指定输出路径（仅在用户指定时使用）
 cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --latest --lang zh --output "path/to/report.md"
 
-# Version comparison with LLM enhancement (automatic when token is valid)
-# Step 1: script prepares analysis data and signals ANALYSIS_DATA_READY
+# 版本对比（自动 LLM 增强，当 token 有效时）
+# 步骤 1：脚本准备分析数据并发出 ANALYSIS_DATA_READY 信号
 cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --target v1.3.0 --compare v1.2.3 --lang zh
-# Step 2: AI agent reads analysis-data.json, calls LLM for comprehensive analysis, writes llm-results.json
-# Step 3: apply LLM results and generate final report
+# 步骤 2：AI agent 读取 analysis-data.json，调用 LLM 进行综合分析，写入 llm-results.json
+# 步骤 3：应用 LLM 结果并生成最终报告
 cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --target v1.3.0 --compare v1.2.3 --apply-llm-results "<snapshot-dir>/openclaw-openclaw-v1.3.0-llm-results.json" --lang zh
 
-# Version comparison (rule-based only — forcefully disable LLM even with valid token)
-cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --target v1.3.0 --compare v1.2.3 --no-llm --lang zh
+# 其他模式
+cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --latest --lang zh
+cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --from v1.1.0 --to v1.3.0 --lang zh
+cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --latest --include-beta --lang zh
 
-# Other modes
-cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --latest --lang en
-cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --from v1.1.0 --to v1.3.0 --lang en
-cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --latest --include-beta --lang en
-
-# Manual cache cleanup (removes all cached snapshots and intermediate files)
+# 手动缓存清理（删除所有缓存 snapshot 和中间文件）
 cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --clean-cache
 
 ```
 
-**Output behavior:**
-- If `--output` is **omitted** → report is written to the **current working directory** as `{snapshot_stem}-analysis.md`.
-- If `--output <path>` is provided → report is written to the exact specified path.
-- The script prints the final report path to stdout after completion.
-- **After the analysis completes, you MUST include BOTH the absolute file path of the generated report AND the snapshot cache directory in your response to the user.** Use this format:
+**输出行为：**
+- 如果省略 `--output` → 报告写入**当前工作目录**，文件名为 `{snapshot_stem}-analysis.md`。
+- 如果提供了 `--output <path>` → 报告写入指定路径。
+- 脚本完成后向 stdout 打印最终报告路径。
+- **分析完成后，你必须在回复中同时包含生成的报告的绝对文件路径和 snapshot 缓存目录。** 使用以下格式：
 
 ```
 | 类型 | 路径 |
@@ -563,127 +555,127 @@ cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_relea
 ```
 
 
-### 7. Apply Priority Rules
+### 7. 应用优先级规则
 
-### 6.1 Classification Categories
+### 6.1 分类维度
 
-The analyzer now classifies changes into these additional categories:
-- **CLI**: CLI commands, flags, options, arguments
-- **Config**: Configuration schema, defaults, config files
-- **Dependency**: Dependency requirements, peerDependencies, Node.js version
-- **Migration**: Breaking changes, upgrade guides, migration notes
-- **Docs**: Documentation updates, guides, tutorials
-- **Known Issue**: Known limitations, workarounds, deprecations
+分析器现在将变更分类到以下额外维度：
+- **CLI**：CLI 命令、flags、options、arguments
+- **Config**：配置 schema、默认值、配置文件
+- **Dependency**：依赖要求、peerDependencies、Node.js 版本
+- **Migration**：破坏性变更、升级指南、迁移说明
+- **Docs**：文档更新、指南、教程
+- **Known Issue**：已知限制、workarounds、废弃项
 
-### 6.2 Chinese Release Notes Support
+### 6.2 中文 Release Notes 支持
 
-The analyzer now detects Chinese keywords in release notes, including:
+分析器现在检测 release notes 中的中文关键词，包括：
 - 新增, 新功能, 修复, 安全, 性能, 破坏性变更
 - 插件, 配置, 依赖, 迁移, 文档, 已知问题
 
-### 6.3 Conventional Commit Support
+### 6.3 Conventional Commit 支持
 
-The analyzer now recognizes Conventional Commit prefixes:
+分析器现在识别 Conventional Commit 前缀：
 - `feat:`, `fix:`, `perf:`, `docs:`, `refactor:`, `test:`, `build:`, `ci:`, `chore:`, `revert:`
-- **Breaking markers**: `feat!:`, `fix!:`, and any prefix with `!` are automatically classified as `breaking` changes.
+- **Breaking 标记**：`feat!:`, `fix!:` 以及任何带 `!` 的前缀自动归类为 `breaking` 变更。
 
-Prioritize analysis in this order:
+按以下顺序优先分析：
 
-1. Plugin system changes: plugin API, lifecycle hooks, manifest schema, loader, registry, runtime.
-2. API/SDK changes: public methods, package exports, TypeScript types, deprecations, migration notes.
-3. Security fixes: CVE, vulnerabilities, auth, token, permission, dependency security issues.
-4. Performance and stability: crash, hang, deadlock, race, memory leak, startup speed, latency, resource use.
-5. General features and bug fixes.
+1. 插件系统变更：plugin API、lifecycle hooks、manifest schema、loader、registry、runtime。
+2. API/SDK 变更：公共方法、package exports、TypeScript 类型、废弃项、迁移说明。
+3. 安全修复：CVE、漏洞、auth、token、permission、依赖安全问题。
+4. 性能与稳定性：crash、hang、deadlock、race、memory leak、startup speed、latency、资源使用。
+5. 一般 feature 和 bug fix。
 
-### 6.4 Rule-Based Baseline Analysis Architecture
+### 6.4 规则基线分析架构
 
-The rule-based analyzer uses a **two-stage filtering** architecture to balance recall and precision:
+规则分析器采用**两级过滤**架构平衡召回率和精确率：
 
-**Stage 1 — Keyword Recall (weighted broad match)**
-- `classify_text()` scores each release note item against keyword lists for all categories (English and Chinese). This stage prioritizes recall — it may include false positives.
-- Keywords are matched with word-boundary protection for English (`\b`); Chinese keywords use direct substring matching.
-- **Weighted scoring**: match weights differ by term length and form:
-  - **Phrases** (containing spaces or ≥15 characters): weight **3** — e.g., `"breaking change"`, `"remote code execution"`, `"affected version"` carry more signal than isolated words.
-  - **Medium-length terms** (6–14 characters): weight **2** — e.g., `"plugin"`, `"config"`, `"sandbox"`.
-  - **Short terms** (<6 characters): weight **1** — e.g., `"api"`, `"fix"`, `"cli"`.
-  - Chinese terms follow the same principle: ≥3-character terms weight **2**, shorter terms weight **1**.
-- **Section context bonus**: when `classify_release()` detects that an item sits under a Markdown heading (e.g., `## Breaking Changes`), the matching section category receives a +5 score bonus in `item_categories()`. This turns heading structure into a strong classification signal even when the item text itself is ambiguous.
-- **Threshold filtering**: `item_categories()` drops categories whose total score falls below 2. A single weak short-word match (score 1) is insufficient to survive; it needs at least a medium-term hit (score 2+) or multiple short-word hits.
+**阶段 1 — 关键词召回（加权宽泛匹配）**
+- `classify_text()` 针对所有类别的关键词列表（英文和中文）为每条 release note item 打分。此阶段优先召回率——可能包含假阳性。
+- 英文关键词使用词边界保护（`\b`）进行匹配；中文关键词使用直接子串匹配。
+- **加权评分**：匹配权重根据词长度和形式有所不同：
+  - **短语**（含空格或 ≥15 字符）：权重 **3** — 例如 `"breaking change"`、`"remote code execution"`、`"affected version"` 比孤立单词携带更多信号。
+  - **中等长度词**（6-14 字符）：权重 **2** — 例如 `"plugin"`、`"config"`、`"sandbox"`。
+  - **短词**（<6 字符）：权重 **1** — 例如 `"api"`、`"fix"`、`"cli"`。
+  - 中文词遵循同样原则：≥3 字符的词权重 **2**，更短的权重 **1**。
+- **章节上下文加分**：当 `classify_release()` 检测到 item 位于 Markdown 标题下（例如 `## Breaking Changes`）时，匹配的章节类别在 `item_categories()` 中获得 +5 分数奖励。这使标题结构成为强分类信号，即使 item 文本本身模糊。
+- **阈值过滤**：`item_categories()` 丢弃总分低于 2 的类别。单个弱短词匹配（分数 1）不足以保留；至少需要中等长度命中（分数 2+）或多个短词命中。
 
-**Stage 2 — Explicit Signal Validation (strict filter)**
-- `item_categories()` applies per-category `has_explicit_xxx_signal()` validators after keyword matching.
-- Each validator uses two signals:
-  - `negative_tokens`: known false-positive patterns that disqualify the category (e.g., `"token-efficiency"` triggers `security` keywords but is rejected by `has_explicit_security_signal()`).
-  - `strong_tokens`: confirmation signals required to accept the category.
-- **Semantic pattern matching** for `breaking`: in addition to token lists, `has_explicit_breaking_signal()` uses regex patterns to catch common breaking expressions:
-  - `no longer \w+` — e.g., "no longer accepts", "no longer supports"
-  - `requires \w+ [\d\.\+]+` — e.g., "requires node 18+"
-  - `dropped (support|the|compatibility|for)` — e.g., "dropped support for legacy API"
-  - `removed (the )?[\w-]+ (option|flag|command|method|api)` — e.g., "removed the --debug flag"
-- Categories requiring explicit validation: `breaking`, `security`, `dependency`, `migration`, `plugin`, `api_sdk`, `cli`, `config`.
+**阶段 2 — 显式信号验证（严格过滤）**
+- `item_categories()` 在关键词匹配后应用每个类别的 `has_explicit_xxx_signal()` 验证器。
+- 每个验证器使用两种信号：
+  - `negative_tokens`：已知会取消该类别的假阳性模式（例如 `"token-efficiency"` 触发 `security` 关键词但被 `has_explicit_security_signal()` 拒绝）。
+  - `strong_tokens`：接受该类别的确认信号。
+- **语义模式匹配**用于 `breaking`：除 token 列表外，`has_explicit_breaking_signal()` 使用正则模式捕获常见 breaking 表达：
+  - `no longer \w+` — 例如 "no longer accepts"、"no longer supports"
+  - `requires \w+ [\d\.\+]+` — 例如 "requires node 18+"
+  - `dropped (support|the|compatibility|for)` — 例如 "dropped support for legacy API"
+  - `removed (the )?[\w-]+ (option|flag|command|method|api)` — 例如 "removed the --debug flag"
+- 需要显式验证的类别：`breaking`、`security`、`dependency`、`migration`、`plugin`、`api_sdk`、`cli`、`config`。
 
-**Stage 3 — Internal QA Downgrade**
-- `is_internal_qa_item()` detects test-only, fixture, or harness-only changes that lack public-surface signals (e.g., `coverage`, `qa-lab`, `fixture`).
-- These items are stripped of high-sensitivity categories (`plugin`, `api_sdk`, `security`, `breaking`, etc.) and downgraded to `docs` to prevent false feature/fix classifications.
+**阶段 3 — 内部 QA 降级**
+- `is_internal_qa_item()` 检测仅测试、fixture 或 harness-only 的变更，这些变更缺少公开 surface 信号（例如 `coverage`、`qa-lab`、`fixture`）。
+- 这些 item 被剥离高敏感度类别（`plugin`、`api_sdk`、`security`、`breaking` 等）并降级为 `docs`，以防止错误的 feature/fix 分类。
 
-**Risk Assessment**
-- `risk_level()` derives per-item risk from final categories and item text:
-  - `breaking`/`migration`/`dependency` → `high` (with runtime-removal signals) or `medium`.
-  - `security` → `high` (with CVE/credential signals) or `medium`.
-  - `plugin`/`api_sdk`/`cli`/`config` → `medium` only if breaking/signature/removal/deprecated signals present; otherwise `low` for pure features or fixes.
-  - `performance` → `medium` (with crash/deadlock signals) or `low`.
+**风险评估**
+- `risk_level()` 从最终类别和 item 文本推导每条 item 的风险：
+  - `breaking`/`migration`/`dependency` → `high`（含 runtime-removal 信号）或 `medium`。
+  - `security` → `high`（含 CVE/credential 信号）或 `medium`。
+  - `plugin`/`api_sdk`/`cli`/`config` → 仅在存在 breaking/signature/removal/deprecated 信号时为 `medium`；否则纯 feature 或 fix 为 `low`。
+  - `performance` → `medium`（含 crash/deadlock 信号）或 `low`。
 
-This architecture ensures broad coverage of release note signals while controlling false positives through category-specific guards.
+此架构确保广泛覆盖 release note 信号，同时通过类别特定的守卫控制假阳性。
 
-### 7. Identify Public Surface Impact
+### 7. 识别公开 Surface 影响
 
-Treat these as developer-visible public surface changes:
+将以下视为开发者可见的公开 surface 变更：
 
-- Public API method names, signatures, parameters, return values.
-- CLI commands, flags, behavior, or output format.
-- Configuration schema, defaults, or required fields.
-- Plugin manifest fields, versions, lifecycle hooks, loader behavior, plugin registry contracts.
-- SDK package exports, types, documented usage, examples, or deprecation notices.
-- Required runtime versions such as Node.js version requirements.
+- 公共 API 方法名、签名、参数、返回值。
+- CLI 命令、flags、行为或输出格式。
+- 配置 schema、默认值或必填字段。
+- Plugin manifest 字段、版本、lifecycle hooks、loader 行为、plugin registry 契约。
+- SDK package exports、类型、文档用法、示例或废弃通知。
+- 所需的运行时版本，例如 Node.js 版本要求。
 
-Do not automatically label these as developer-visible:
+不要自动将以下标记为开发者可见：
 
-- Internal refactors.
-- Private variable/function renames.
-- Test-only changes.
-- Internal algorithm optimizations without documented behavior changes.
-- Build-tool changes without runtime or public API effect.
+- 内部重构。
+- 私有变量/函数重命名。
+- 仅测试变更。
+- 无文档行为变更的内部算法优化。
+- 无运行时或公共 API 影响的构建工具变更。
 
-### 8. Generate the Report
+### 8. 生成报告
 
-Use this report structure consistently:
+始终使用以下报告结构：
 
-#### 8.1 Fixed output sections
+#### 8.1 固定输出章节
 
-These sections are part of the standard report layout:
+这些章节是标准报告布局的组成部分：
 
-- **Report header**: title, repository, target version, compare version, generation timestamp.
-- **Version information**: table with target version, publish date, status, compare version, number of releases analyzed, data source, snapshot file path, and report file path.
-- **Included Releases** (only when `scoped releases > 1`): table listing all releases in the analyzed range with version, publish date, and status.
-- **Executive Summary** (总体结论 / 执行摘要): upgrade recommendation label, dominant theme, change magnitude (total items with risk breakdown), top 5 most critical changes with appendix links and risk icons, and a one-line judgment tailored to the release profile (prerelease warning, breaking-change caution, security priority, developer-surface updates, or low-risk routine).
-- **Developer Conclusion** (面向 Channel / 插件开发者的一句话结论): a one-sentence verdict for plugin/channel developers, with conditional branching based on breaking changes, security density, plugin/API count, or config changes.
-- **Thematic Overview** (变更主题概览): semantic clustering of all changes into 8-15 functional themes, sorted by risk. Each theme shows item count, risk level, related commits, and summary.
-- **Progressive Fix Detection** (渐进式修复检测): when analyzing a version range, shows fix chains where the same issue was addressed incrementally across releases (e.g., mitigation → partial fix → complete fix). Each chain displays stages with version, fix description, and completeness level, plus final status and impact assessment.
-- **Cumulative Breaking Change Analysis** (累积 Breaking Change 分析): when analyzing a version range, highlights cases where individual versions appear low-risk but the aggregate impact across the upgrade path is high. Shows per-version risk vs. cumulative risk, with a concrete explanation of why skipping intermediate versions is more dangerous.
-- **High-Risk Theme Details** (高风险主题详解): deep-dive analysis for high and medium risk themes. Each theme expanded with impact description, affected files, related commits, and navigation links to appendix detailed notes. Limited to top 8 risky themes.
-- **Code Change Evidence** (代码变更证据链): note-to-commit association table showing which commits correspond to which release notes, with changed files and reasoning.
-- **Shadow Changes** (未记录变更提示): commits that modify public surfaces but have no corresponding release note.
-- **Compatibility Risks** (兼容性与风险点): high and medium risk items relevant to plugin/channel developers, with contextual risk descriptions (breaking change, security tightening, dependency shifts, config changes).
-- **Suggested Test Points** (建议验证的测试点): actionable regression test recommendations derived from detected signals (auth, plugin, CLI, channel, dependency).
-- **Ignorable Changes** (可暂时忽略的变更): low-risk, low-relevance items that can be deferred in a second reading.
-- **Facts, Inferences, and Uncertainties**: structured transparency section. Facts cover snapshot provenance and version status. Inferences cover classification method, recommendation derivation, dominant theme, and concentrated component signals. Uncertainties cover low-confidence items, missing migration guidance, ambiguous dependency signals, and the lack of local project scanning.
-- **References**: links to all analyzed release pages.
-- **Original Release Notes (Enhanced Index)**: raw release note items in original order, each annotated with appendix ID, categories, and risk level.
-- **Appendix: Complete Per-Release-Note Details**: full interpretation table for every analyzable item. Fields: component, release tag, risk level, confidence, categories, audience, raw text, interpretation, suggested actions, and cross-reference hints to related items.
+- **报告头**：标题、仓库、目标版本、对比版本、生成时间戳。
+- **版本信息**：表格包含目标版本、发布日期、状态、对比版本、分析的 release 数量、数据来源、snapshot 文件路径和报告文件路径。
+- **包含的 Releases**（仅在 `scoped releases > 1` 时）：表格列出分析范围内的所有 releases，含版本、发布日期和状态。
+- **Executive Summary**（总体结论）：升级建议标签、主导主题、变更规模（总 item 数及风险分解）、前 5 个最关键变更（含附录链接和风险图标），以及针对 release 特征定制的一句话判断（prerelease 警告、breaking-change 提醒、安全优先、开发者 surface 更新或低风险例行）。
+- **Developer Conclusion**（面向 Channel / 插件开发者的一句话结论）：面向 plugin/channel 开发者的一句话 verdict，基于 breaking changes、安全密度、plugin/API 数量或 config 变更进行条件分支。
+- **Thematic Overview**（变更主题概览）：将所有变更语义聚类为 8-15 个功能主题，按风险排序。每个主题显示 item 数量、风险等级、相关 commits 和摘要。
+- **Progressive Fix Detection**（渐进式修复检测）：分析版本范围时，展示同一 issue 在多个版本中逐步修复的链条（例如缓解 → 部分修复 → 完整修复）。每条链显示各阶段版本、修复描述和完整度，以及最终状态和影响评估。
+- **Cumulative Breaking Change Analysis**（累积 Breaking Change 分析）：分析版本范围时，突出单个版本看似低风险但整个升级路径累积影响很高的情况。展示逐版本风险与累积风险对比，并具体解释为什么跳过中间版本更危险。
+- **High-Risk Theme Details**（高风险主题详解）：高风险和中风险主题的深度分析。每个主题扩展为影响描述、受影响文件、相关 commits 和指向附录详细 notes 的导航链接。限于前 8 个风险主题。
+- **Code Change Evidence**（代码变更证据链）：note-to-commit 关联表，展示哪些 commits 对应哪些 release notes，含变更文件和推理依据。
+- **Shadow Changes**（未记录变更提示）：修改了公开 surface 但没有对应 release note 的 commits。
+- **Compatibility Risks**（兼容性与风险点）：与 plugin/channel 开发者相关的高风险和中风险 item，含上下文风险描述（breaking change、安全收紧、依赖变动、配置变更）。
+- **Suggested Test Points**（建议验证的测试点）：从检测到的信号（auth、plugin、CLI、channel、dependency）推导的可操作回归测试建议。
+- **Ignorable Changes**（可暂时忽略的变更）：低风险、低相关性的 item，可在二次阅读时延后处理。
+- **Facts, Inferences, and Uncertainties**：结构化透明性章节。Facts 涵盖 snapshot 来源和版本状态。Inferences 涵盖分类方法、建议推导、主导主题和集中组件信号。Uncertainties 涵盖低置信度 item、缺失的迁移指导、模糊的依赖信号和缺少本地项目扫描。
+- **References**：所有分析的 release 页面链接。
+- **Original Release Notes (Enhanced Index)**：原始 release note item 按原始顺序排列，每条标注附录 ID、类别和风险等级。
+- **Appendix: Complete Per-Release-Note Details**：每条可分析 item 的完整解读表。字段：component、release tag、风险等级、置信度、类别、受众、原始文本、解读、建议操作和相关 item 的交叉引用提示。
 
-#### 8.2 Classification dimensions, not standalone sections by default
+#### 8.2 分类维度，默认不作为独立章节
 
-The following categories are classification dimensions used for per-note tagging, prioritization, risk assessment, and impact interpretation. They are **not** standalone top-level sections in the default report layout:
+以下类别是用于逐条标记、优先级排序、风险评估和影响解读的分类维度。它们在默认报告布局中**不是**独立的顶层章节：
 
 - CLI
 - Config
@@ -692,33 +684,33 @@ The following categories are classification dimensions used for per-note tagging
 - Docs
 - Known Issue
 
-When these signals are detected, surface them through the Executive Summary, Deep Dive, Compatibility Risks, or Appendix sections rather than promising dedicated top-level headings.
+当检测到这些信号时，通过 Executive Summary、Deep Dive、Compatibility Risks 或 Appendix 章节展示它们，而非承诺独立的顶层标题。
 
 
-## Upgrade Recommendation Labels
+## 升级建议标签
 
-| English | Chinese | When to use |
-|--------|---------|-------------|
-| Recommend Upgrade | 建议升级 | Security fixes, severe bug fixes, crash/deadlock/memory-leak fixes, or important features with low risk. |
-| Upgrade with Caution | 谨慎升级 | Breaking changes, dependency/runtime requirement changes, public API changes, CLI changes, or config behavior changes. |
-| Defer Upgrade | 暂缓升级 | No meaningful benefit, unclear release data, high risk without matching user need, or unstable prerelease for production. |
-| Conditional Upgrade | 仅特定场景建议升级 | Changes mainly benefit plugin developers, SDK users, security-sensitive users, or another specific group. |
-| Insufficient Data | 信息不足，建议进一步分析 | Release notes are missing, ambiguous, or insufficient for a reliable conclusion. |
+| 标签 | 使用场景 |
+|------|---------|
+| 建议升级 | 安全修复、严重 bug 修复、crash/deadlock/memory-leak 修复，或低风险的重要 feature。 |
+| 谨慎升级 | Breaking changes、依赖/运行时要求变更、公共 API 变更、CLI 变更或配置行为变更。 |
+| 暂缓升级 | 无实质收益、release 数据不清晰、高风险但不符合用户需求，或生产环境不稳定的 prerelease。 |
+| 仅特定场景建议升级 | 变更主要惠及 plugin 开发者、SDK 使用者、安全敏感用户或其他特定群体。 |
+| 信息不足，建议进一步分析 | Release notes 缺失、模糊或不足以得出可靠结论。 |
 
-## Scenario-Based Recommendations
+## 场景化升级建议
 
-Always consider these user groups:
+始终考虑以下用户群体：
 
-- Plugin developers: focus on hooks, manifests, lifecycle APIs, loader/runtime behavior, registry contracts, compatibility declarations.
-- API/SDK users: focus on public APIs, package exports, TypeScript types, deprecations, migration notes.
-- Security-sensitive users: focus on CVE/vulnerability/auth/token/permission changes and affected versions.
-- Stability-sensitive users: focus on crash, hang, deadlock, memory leak, data loss, performance, and high-load behavior.
-- Ordinary users: focus on visible features, common bug fixes, upgrade simplicity, and known risks.
+- **Plugin 开发者**：关注 hooks、manifests、lifecycle APIs、loader/runtime 行为、registry 契约、兼容性声明。
+- **API/SDK 使用者**：关注公共 APIs、package exports、TypeScript 类型、废弃项、迁移说明。
+- **安全敏感用户**：关注 CVE/漏洞/auth/token/permission 变更和受影响版本。
+- **稳定性敏感用户**：关注 crash、hang、deadlock、memory leak、data loss、性能和高负载行为。
+- **普通用户**：关注可见 feature、常见 bug 修复、升级简便性和已知风险。
 
-## Project Scanning Rules
+## 项目扫描规则
 
-Do not inspect local project files unless the user explicitly requests project-aware analysis. When authorized, inspect only relevant files such as `package.json`, lockfiles, `openclaw.config.*`, plugin manifests, and source files likely to import OpenClaw APIs. Avoid `.env`, credentials, secrets, private keys, or unrelated files.
+除非用户明确要求项目级分析，否则不要检查本地项目文件。获得授权后，仅检查相关文件，如 `package.json`、lockfiles、`openclaw.config.*`、plugin manifests，以及可能导入 OpenClaw APIs 的源文件。避免 `.env`、凭证、secrets、private keys 或无关文件。
 
-## References
+## 参考
 
-Load `references/analysis-rules.md` when needing detailed classification keywords, report template guidance, or decision rules.
+需要详细的分类关键词、报告模板指导或决策规则时，加载 `references/analysis-rules.md`。

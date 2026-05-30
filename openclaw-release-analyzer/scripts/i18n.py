@@ -1,7 +1,7 @@
 """Internationalization (i18n) module for the OpenClaw Release Analyzer.
 
-Contains all bilingual string bundles (English and Chinese),
-language detection, and release-note text translation helpers.
+Contains the Chinese string bundle and release-note text translation helpers.
+All reports are generated in Chinese with technical proper nouns kept in English.
 """
 
 from __future__ import annotations
@@ -11,156 +11,6 @@ from typing import Dict, List, Tuple
 
 T = Dict[str, str]
 
-
-# ---------------------------------------------------------------------------
-# English string bundle
-# ---------------------------------------------------------------------------
-
-def _en() -> T:
-    return {
-        "report_title": "OpenClaw Release Analysis Report",
-        "overall_conclusion": "Overall Conclusion",
-        "recommendation": "Recommendation",
-        "recommend_upgrade": "Recommend Upgrade",
-        "upgrade_with_caution": "Upgrade with Caution",
-        "defer_upgrade": "Defer Upgrade",
-        "conditional_upgrade": "Conditional Upgrade",
-        "insufficient_data": "Insufficient Data",
-        "version_info": "Version Information",
-        "field_target_version": "Target Version",
-        "field_compare_version": "Compare Version",
-        "field_publish_date": "Published Date",
-        "field_target_status": "Target Status",
-        "field_releases_analyzed": "Releases Analyzed",
-        "field_data_source": "Data Source",
-        "stable": "Stable",
-        "prerelease_beta": "Prerelease/Beta",
-        "key_changes": "Key Changes Summary",
-        "new_features": "New Features",
-        "bug_fixes": "Bug Fixes",
-        "breaking_changes": "Breaking Changes / Upgrade Risks",
-        "plugin_impact": "Plugin System Impact",
-        "api_sdk_impact": "API / SDK Impact",
-        "security_fixes": "Security Fixes",
-        "perf_stability": "Performance and Stability",
-        "developer_conclusion": "One-line Conclusion for Channel / Plugin Developers",
-        "top_changes_for_devs": "Most Important Changes for Channel / Plugin Developers (Top 10)",
-        "developer_impact_analysis": "Impact Analysis for Plugin / Channel Developers",
-        "compatibility_risks": "Compatibility and Risk Points",
-        "suggested_test_points": "Suggested Test Points",
-        "ignorable_changes": "Changes You Can Usually Ignore for Now",
-        "no_relevant_changes": "No plugin/channel-focused items were strongly detected in this release; rely on the enhanced original notes and appendix for manual review.",
-        "scenario_recommendations": "Scenario-Based Upgrade Recommendations",
-
-        "scenario_plugin_dev": "Plugin Developers",
-        "scenario_api_users": "API / SDK Users",
-        "scenario_security": "Security-Sensitive Users",
-        "scenario_stability": "Stability-Sensitive Users",
-        "scenario_ordinary": "Ordinary Users",
-        "beta_preview": "Beta / Prerelease Preview",
-        "facts_inferences": "Facts, Inferences, and Uncertainties",
-        "facts_label": "Facts",
-        "inferences_label": "Inferences",
-        "uncertainties_label": "Uncertainties",
-        "references": "References",
-        "empty_feature": "No new features identified in the release notes.",
-        "empty_fix": "No bug fixes identified in the release notes.",
-        "empty_breaking": "No breaking changes identified.",
-        "empty_plugin": "No explicit plugin system changes identified.",
-        "empty_api_sdk": "No explicit API/SDK changes identified.",
-        "empty_security": "No explicit security fixes identified.",
-        "empty_performance": "No explicit performance or stability changes identified.",
-        "no_baseline": "No compare baseline found",
-        "no_prerelease": "No newer beta/prerelease found.",
-        "prerelease_preview_note": "The following prereleases are listed as forward-looking previews only, not as default production upgrade targets.",
-        "prerelease_included_note": "Prerelease preview included as requested; treat with caution in production environments.",
-        "fact_analysis_base": "At the start of this run, release metadata and release notes were fetched from the GitHub Releases API and written to a local snapshot; analysis is based on that snapshot.",
-        "fact_stable_criteria": "Stable release is determined by GitHub prerelease=false and draft=false.",
-        "fact_release_url": "Target release URL",
-        "inference_classification": "Classification is based on release note section titles, bullet points, and keyword matching.",
-        "inference_recommendation": "Upgrade recommendation is derived from combined signals across security, stability, plugin system, API/SDK, and breaking-change categories.",
-        "uncertainty_compat": "Compatibility impacts not explicitly stated in release notes require further inspection of compare diffs, PRs, issues, or source code.",
-        "uncertainty_project": "This report does not scan local project files without explicit user authorization.",
-        "footer": "Generated by openclaw-release-analyzer skill. Please refer to the official OpenClaw release notes and documentation for authoritative information.",
-
-        # token status
-        "token_valid_info": "GitHub token verified. Proceeding with LLM-enhanced diff analysis.",
-        "token_invalid_warning": "Warning: GitHub token is invalid or expired. Only rule-based analysis will be performed; results may be less accurate.",
-        "token_missing_warning": "Warning: No GitHub token provided. Only rule-based analysis will be performed; results may be less accurate. Provide a token via --github-token or set the GITHUB_TOKEN environment variable to enable LLM-enhanced diff analysis.",
-        "analysis_mode_rule_only": "Fresh GitHub Releases API snapshot (rule-based only, no LLM diff analysis)",
-        "analysis_mode_llm_enhanced": "Fresh GitHub Releases API + Compare Diff + LLM analysis",
-
-        "repo": "Repository",
-        "generated_at": "Generated at",
-        "unknown": "Unknown",
-        "no_summary": "No summary",
-
-        # scenario advice
-        "adv_plugin_has_signal": "Review plugin manifest compatibility, lifecycle hook signatures, and loader/registry contracts. Test the plugin in the target version before deploying.",
-        "adv_plugin_no_signal": "No explicit plugin system changes identified; no separate upgrade is typically required for plugin compatibility alone.",
-        "adv_api_has_signal": "Review public API surface, SDK package exports, TypeScript types, deprecation notices, and migration notes before upgrading.",
-        "adv_api_no_signal": "No explicit API/SDK changes identified; standard usage carries low risk.",
-        "adv_security_has_signal": "Prioritize assessment of affected version ranges and upgrade in the test environment before production rollout.",
-        "adv_security_no_signal": "No explicit security fixes identified. For high-security environments, continue monitoring official security advisories.",
-        "adv_perf_has_signal": "Run regression and stress tests in the pre-production environment to confirm performance and stability improvements.",
-        "adv_perf_no_signal": "No explicit performance or stability fixes identified.",
-        "adv_feature_fix": "Decide based on whether the new features or bug fixes affect current workflows. Test in a non-production environment before upgrading.",
-        "adv_insufficient": "Insufficient release note data. Review the original release notes before deciding.",
-        # recommendation reasons
-        "reason_prerelease": "Target is a prerelease and is not recommended as a default production upgrade.",
-        "reason_security": "Security-related signals detected in release notes. Prompt assessment and upgrade is advised.",
-        "reason_breaking": "Breaking changes or plugin/API/SDK signals detected. Check compatibility before upgrading.",
-        "reason_stability": "Performance or stability signals detected. Validate in a test environment before upgrading.",
-        "reason_feature_fix": "Release contains features or bug fixes. Whether to upgrade depends on whether these changes match current use cases.",
-        "reason_insufficient": "Release notes provide insufficient structured data. Review the original release notes and linked PRs/issues for more context.",
-        # table headers for prerelease
-        "th_version": "Version",
-        "th_publish_date": "Published Date",
-        "th_description": "Description",
-        # Included releases section
-        "included_releases": "Included Releases",
-        # Upgrade action checklist
-        "upgrade_checklist": "Upgrade Action Checklist",
-        "checklist_intro": "Based on detected signals, consider the following actions before upgrading:",
-        "check_breaking": "Breaking Changes Found",
-        "check_breaking_desc": "Review breaking changes, check compatibility, and prepare migration steps before upgrading.",
-        "check_plugin": "Plugin System Changes",
-        "check_plugin_desc": "Review plugin manifest, hook signatures, and test plugin compatibility in target version.",
-        "check_api": "API/SDK Changes",
-        "check_api_desc": "Review public API surface changes, TypeScript types, and update dependent code accordingly.",
-        "check_security": "Security Fixes Found",
-        "check_security_desc": "Prioritize security fixes. Test in non-production environment before production rollout.",
-        "check_config": "Configuration Changes",
-        "check_config_desc": "Review config schema changes and update openclaw.config.* files as needed.",
-        "check_dep": "Dependency Changes",
-        "check_dep_desc": "Review dependency requirement changes (Node.js version, peerDependencies, etc.).",
-        "analytical_summary": "Analytical Summary",
-        "per_note_analysis": "Appendix: LLM-Enhanced Per-Note Details",
-
-        "change_interpretation": "Interpretation",
-        "raw_change": "Raw change",
-        "categories_label": "Categories",
-        "risk_label": "Risk",
-        "audience_label": "Audience",
-        "action_label": "Suggested Action",
-        "component_label": "Component",
-        "release_label": "Release",
-        "confidence_label": "Confidence",
-        "affected_files_label": "Affected Files",
-        "code_evidence_label": "Code Evidence",
-        "no_change_items": "No analyzable release note items found.",
-        "risk_high": "High Risk",
-        "risk_medium": "Medium Risk",
-        "risk_low": "Low Risk",
-        "confidence_high": "High",
-        "confidence_medium": "Medium",
-        "confidence_low": "Low",
-    }
-
-
-# ---------------------------------------------------------------------------
-# Chinese string bundle
-# ---------------------------------------------------------------------------
 
 def _zh() -> T:
     return {
@@ -302,17 +152,6 @@ def _zh() -> T:
         "confidence_medium": "中",
         "confidence_low": "低",
     }
-
-
-# ---------------------------------------------------------------------------
-# Language detection and lookup helper
-# ---------------------------------------------------------------------------
-
-def detect_language(text: str) -> str:
-    """Detect 'zh' if the text contains CJK characters, otherwise 'en'."""
-    if re.search(r"[一-鿿]", text):
-        return "zh"
-    return "en"
 
 
 def i(key: str, strings: T) -> str:

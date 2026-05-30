@@ -414,3 +414,30 @@ def default_cache_dir() -> str:
         return os.path.join(base, "openclaw-release-analyzer", "snapshots")
     base = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
     return os.path.join(base, "openclaw-release-analyzer", "snapshots")
+
+
+# ---------------------------------------------------------------------------
+# Recursive merge aggregation configuration
+# ---------------------------------------------------------------------------
+
+# When analyzing multiple versions, use recursive merge aggregation instead of
+# horizontal chunking. This enables cross-version progressive fix detection
+# and cumulative risk assessment by giving the LLM full context within each
+# version group and then merging results hierarchically.
+RECURSIVE_MERGE_ENABLED = True
+
+# Maximum tokens per leaf group. Each leaf contains complete notes + commits
+# for 1-3 consecutive versions. Should stay well below MAX_TOKENS_PER_CHUNK
+# to leave room for the LLM prompt and output.
+RECURSIVE_MERGE_MAX_TOKENS_PER_LEAF = 80_000
+
+# Maximum versions per leaf group. Hard cap to prevent any single leaf from
+# growing too large even if token budget allows more.
+RECURSIVE_MERGE_MAX_VERSIONS_PER_LEAF = 3
+
+# Maximum recursion depth. Prevents runaway recursion if something goes wrong.
+RECURSIVE_MERGE_MAX_DEPTH = 10
+
+# Minimum number of versions to trigger recursive merge. For single-version
+# or two-version analysis, fall back to standard single-pass LLM analysis.
+RECURSIVE_MERGE_MIN_VERSIONS = 3

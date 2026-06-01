@@ -47,3 +47,6 @@ llm-results.json
 analysis-data.json
 base-analysis.json
 *-chunk-*.json
+
+.claude
+.vscode

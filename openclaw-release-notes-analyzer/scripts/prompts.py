@@ -1,4 +1,4 @@
-"""LLM analysis orchestration for the OpenClaw Release Analyzer.
+"""LLM analysis orchestration for the OpenClaw Release Notes Analyzer.
 
 This module handles:
 - Commit relevance scoring and selection
@@ -1635,7 +1635,7 @@ def build_merge_prompt(group_a: Dict[str, Any], group_b: Dict[str, Any], lang: s
     b_json = json.dumps(group_b, ensure_ascii=False, indent=2)
 
     return (
-        "# OpenClaw Release Analyzer - 跨版本组合并分析\n\n"
+        "# OpenClaw Release Notes Analyzer - 跨版本组合并分析\n\n"
         "你正在合并两个相邻版本组的分析结果。这不是从头分析，"
         "而是基于已有的结构化分析结果进行整合、去重和跨组关联发现。\n\n"
         "## 版本组 A\n"

@@ -1,6 +1,6 @@
-"""Internationalization (i18n) module for the OpenClaw Release Analyzer.
+"""Chinese string bundle for the OpenClaw Release Notes Analyzer.
 
-Contains the Chinese string bundle and release-note text translation helpers.
+Contains the Chinese UI string dictionary and the i(key, strings) lookup helper.
 All reports are generated in Chinese with technical proper nouns kept in English.
 """
 
@@ -76,15 +76,12 @@ def _zh() -> T:
         "inference_recommendation": "升级建议基于安全、稳定性、插件系统、API/SDK、breaking change 等信号综合判断。",
         "uncertainty_compat": "Release notes 未明确说明的兼容性影响需要进一步查看 compare diff、PR、Issue 或源码。",
         "uncertainty_project": "未经用户明确授权，本报告未扫描本地项目代码。",
-        "footer": "本报告由 openclaw-release-analyzer skill 生成。分析结果以 OpenClaw 官方 release notes 和文档为准。",
+        "footer": "本报告由 openclaw-release-notes-analyzer skill 生成。分析结果以 OpenClaw 官方 release notes 和文档为准。",
 
         # token status
         "token_valid_info": "GitHub token 已验证，将启用 LLM 增强的 diff 分析。",
-        "token_invalid_warning": "警告：GitHub token 无效或已过期。将仅使用规则分析，结果可能不够准确。",
-        "token_missing_warning": "警告：未提供 GitHub token。将仅使用规则分析，结果可能不够准确。可通过 --github-token 传入或设置 GITHUB_TOKEN 环境变量来启用 LLM 增强的 diff 分析。",
-        "analysis_mode_rule_only": "GitHub Releases API 快照（仅规则分析，无 LLM diff 增强）",
-        "analysis_mode_llm_enhanced": "GitHub Releases API + Compare Diff + LLM 分析",
-
+        "token_invalid_warning": "错误：GitHub token 无效或已过期。分析无法继续，请提供有效 token 后重试。",
+        "token_missing_warning": "错误：未提供 GitHub token。分析无法继续。请通过 --github-token 参数或设置 GITHUB_TOKEN 环境变量提供有效 token。",
         "repo": "仓库",
         "generated_at": "生成时间",
         "unknown": "未知",

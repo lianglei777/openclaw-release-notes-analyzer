@@ -1,4 +1,4 @@
-"""Report rendering module for the OpenClaw Release Analyzer.
+"""Report rendering module for the OpenClaw Release Notes Analyzer.
 
 Contains all Markdown report generation functions, including the main
 render_report() function and all rendering helpers.

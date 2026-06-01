@@ -1,4 +1,4 @@
-"""Configuration constants for the OpenClaw Release Analyzer.
+"""Configuration constants for the OpenClaw Release Notes Analyzer.
 
 This module contains all tunable constants, keyword lists, patterns,
 and budget parameters used across the analyzer.
@@ -396,15 +396,15 @@ SEMANTIC_DEDUP_THRESHOLD = 0.80
 def default_cache_dir() -> str:
     """Return the platform-standard cache directory for snapshot files.
 
-    On Windows this uses %LOCALAPPDATA%\\openclaw-release-analyzer\\snapshots,
-    on Linux/macOS it uses $XDG_CACHE_HOME/openclaw-release-analyzer/snapshots
-    (falling back to ~/.cache/openclaw-release-analyzer/snapshots).
+    On Windows this uses %LOCALAPPDATA%\\openclaw-release-notes-analyzer\\snapshots,
+    on Linux/macOS it uses $XDG_CACHE_HOME/openclaw-release-notes-analyzer/snapshots
+    (falling back to ~/.cache/openclaw-release-notes-analyzer/snapshots).
     """
     if platform.system() == "Windows":
         base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
-        return os.path.join(base, "openclaw-release-analyzer", "snapshots")
+        return os.path.join(base, "openclaw-release-notes-analyzer", "snapshots")
     base = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
-    return os.path.join(base, "openclaw-release-analyzer", "snapshots")
+    return os.path.join(base, "openclaw-release-notes-analyzer", "snapshots")
 
 
 # ---------------------------------------------------------------------------

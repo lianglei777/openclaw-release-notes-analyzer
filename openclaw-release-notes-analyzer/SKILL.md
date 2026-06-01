@@ -1,9 +1,9 @@
 ---
-name: openclaw-release-analyzer
+name: openclaw-release-notes-analyzer
 description: 本 Skill 用于分析 OpenClaw GitHub release、release notes、版本对比、升级影响、bug fix、新增 feature、插件系统变化、API/SDK 变化、安全修复、性能/稳定性变化、beta/prerelease 预览，以及 OpenClaw 升级建议。
 ---
 
-# OpenClaw Release Analyzer
+# OpenClaw Release Notes Analyzer
 
 ## 概述
 
@@ -25,7 +25,7 @@ description: 本 Skill 用于分析 OpenClaw GitHub release、release notes、�
 
 ## 默认行为
 
-- 除非用户明确指定其他仓库，否则默认分析 `openclaw/openclaw`。
+- 默认分析 `openclaw/openclaw`。
 - **在任何 API 调用之前，始终验证 GitHub token。** 脚本通过 `/rate_limit` 接口验证 token 有效性；token 可通过 `--github-token` 参数或 `GITHUB_TOKEN` 环境变量提供。
 - **Token 有效** → 自动进入 **LLM 增强 diff 分析模式**（相比纯规则分析，准确度显著提升）。
 - **Token 无效或缺失** → **报错停止，不生成报告**。本 Skill 要求 LLM 分析作为必需步骤，不允许回退到仅规则分析。
@@ -45,8 +45,8 @@ description: 本 Skill 用于分析 OpenClaw GitHub release、release notes、�
 
 **中间产物（snapshots、LLM prompts、基础分析）：**
 - 所有中间文件存储在**平台缓存目录**：
-  - **Windows**：`%LOCALAPPDATA%\openclaw-release-analyzer\snapshots`
-  - **Linux/macOS**：`~/.cache/openclaw-release-analyzer/snapshots`
+  - **Windows**：`%LOCALAPPDATA%\openclaw-release-notes-analyzer\snapshots`
+  - **Linux/macOS**：`~/.cache/openclaw-release-notes-analyzer/snapshots`
 - **绝不**写入 skill 安装目录。如果 `--snapshot-dir` 指向 skill 目录内部，脚本自动回退到平台缓存目录。
 - 中间产物类型和生命周期：
   - `*-release-notes.md`：原始 GitHub API snapshot。保留最近 20 个版本以避免重复 API 获取。
@@ -116,8 +116,8 @@ description: 本 Skill 用于分析 OpenClaw GitHub release、release notes、�
 
 1. 从 GitHub Releases API 获取最新匹配的 release metadata 和 release notes。
 2. 将获取的数据写入本地 snapshot，存储在**平台缓存目录**：
-   - **Windows**：`%LOCALAPPDATA%\openclaw-release-analyzer\snapshots`
-   - **Linux/macOS**：`~/.cache/openclaw-release-analyzer/snapshots`
+   - **Windows**：`%LOCALAPPDATA%\openclaw-release-notes-analyzer\snapshots`
+   - **Linux/macOS**：`~/.cache/openclaw-release-notes-analyzer/snapshots`
    - 仅在明确需要时通过 `--snapshot-dir` 覆盖。
 3. 从磁盘重新加载 snapshot。
 4. **验证缓存一致性**（自动执行，无需用户操作）。在使用任何缓存 snapshot 或 LLM 结果之前，脚本会执行结构完整性、payload 一致性、时效性和 LLM 结果对齐检查。如果任何检查以 error 级别失败，缓存文件将被丢弃并自动重新获取数据。
@@ -518,7 +518,7 @@ cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_relea
 
 # 默认：最新稳定版，输出中文报告，报告写入当前工作目录
 # Token 有效 → 自动 LLM 增强分析（commit-message-bridge）
-# Token 缺失 → 规则分析并发出警告
+# Token 缺失 → 报错退出，不生成报告
 cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_release.py" --latest --lang zh --user-query "帮我分析最新版本"
 
 # 显式指定输出路径（仅在用户指定时使用）
@@ -551,7 +551,7 @@ cd "<user-workspace-root>" && python "<skill-dir>/scripts/analyze_openclaw_relea
 | 类型 | 路径 |
 |------|------|
 | 最终报告 | C:\Users\...\v2026.5.18-analysis.md |
-| 中间缓存 | %LOCALAPPA DATA%\openclaw-release-analyzer\snapshots\  (或 ~/.cache/openclaw-release-analyzer/snapshots/) |
+| 中间缓存 | %LOCALAPPA DATA%\openclaw-release-notes-analyzer\snapshots\  (或 ~/.cache/openclaw-release-notes-analyzer/snapshots/) |
 ```
 
 

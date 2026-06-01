@@ -1,4 +1,4 @@
-"""Core data models for the OpenClaw Release Analyzer."""
+"""Core data models for the OpenClaw Release Notes Analyzer."""
 
 from __future__ import annotations
 

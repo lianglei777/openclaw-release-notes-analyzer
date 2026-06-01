@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze OpenClaw GitHub releases and emit a bilingual Markdown upgrade report."""
+"""Analyze OpenClaw GitHub releases and emit a Chinese Markdown upgrade report."""
 
 from __future__ import annotations
 
@@ -54,7 +54,6 @@ from prompts import (
     llm_results_path,
     merge_chunk_results,
     parse_llm_results,
-    parse_merge_results,
     read_base_analysis,
     select_relevant_commits,
     split_analysis_data_into_chunks,
@@ -80,7 +79,7 @@ from renderer import (
 def request_json(url: str, token: Optional[str] = None) -> Any:
     headers = {
         "Accept": "application/vnd.github+json",
-        "User-Agent": "openclaw-release-analyzer-skill",
+        "User-Agent": "openclaw-release-notes-analyzer-skill",
         "X-GitHub-Api-Version": "2022-11-28",
     }
     if token:
@@ -1519,58 +1518,31 @@ def _is_inside_skill_dir(path: Path) -> bool:
         return False
 
 
-def _cleanup_transient_files(snapshot_dir: Path, repo: str, target_tag: str) -> None:
-    """Remove step-internal transient files after report generation."""
+def _cleanup_target_files(snapshot_dir: Path, repo: str, target_tag: str) -> None:
+    """Remove all intermediate files for a specific target before fresh analysis."""
     repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
     target_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", target_tag).strip("-") or "target"
+    prefix = f"{repo_part}-{target_part}"
 
-    # Clean up base analysis cache
-    base_path = snapshot_dir / f"{repo_part}-{target_part}-base-analysis.json"
-    if base_path.exists():
-        try:
-            base_path.unlink()
-        except OSError:
-            pass
-
-    # Clean up analysis data file (new single-file mode)
-    data_path = snapshot_dir / f"{repo_part}-{target_part}-analysis-data.json"
-    if data_path.exists():
-        try:
-            data_path.unlink()
-        except OSError:
-            pass
-
-    # Clean up chunk data files
-    chunk_pattern = f"{repo_part}-{target_part}-analysis-chunk-*.json"
-    for chunk_file in snapshot_dir.glob(chunk_pattern):
-        try:
-            chunk_file.unlink()
-        except OSError:
-            pass
-
-    # Clean up legacy per-component prompt files (backward compatibility)
-    pattern = f"{repo_part}-{target_part}-*-llm-prompt.json"
-    for prompt_file in snapshot_dir.glob(pattern):
-        try:
-            prompt_file.unlink()
-        except OSError:
-            pass
-
-
-def _cleanup_legacy_prompts(snapshot_dir: Path, repo: str, target_tag: str) -> None:
-    """Clean up only legacy prompt files, preserving base-analysis and data files.
-
-    Used in --apply-llm-results mode to keep transient files available for
-    potential re-runs while removing obsolete legacy artifacts.
-    """
-    repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
-    target_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", target_tag).strip("-") or "target"
-    pattern = f"{repo_part}-{target_part}-*-llm-prompt.json"
-    for prompt_file in snapshot_dir.glob(pattern):
-        try:
-            prompt_file.unlink()
-        except OSError:
-            pass
+    patterns = [
+        f"{prefix}-release-notes.md",
+        f"{prefix}-llm-results.json",
+        f"{prefix}-base-analysis.json",
+        f"{prefix}-analysis-data.json",
+        f"{prefix}-analysis-chunk-*.json",
+        f"{prefix}-leaf-*-analysis-data.json",
+        f"{prefix}-leaf-*-llm-results.json",
+        f"{prefix}-merge-*-prompt.txt",
+        f"{prefix}-merge-*-result.json",
+        f"{prefix}-recursive-merged.json",
+        f"{prefix}-*-llm-prompt.json",
+    ]
+    for pattern in patterns:
+        for f in snapshot_dir.glob(pattern):
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
 
 def _cleanup_expired_cache(snapshot_dir: Path) -> None:
@@ -1905,15 +1877,11 @@ def analyze_recursive(
         write_analysis_data(data, leaf_data_path)
         print(f"  LEAF_DATA[{i+1}]: {leaf_data_path}", file=sys.stderr)
 
-        # Check for cached leaf result
+        # Always require fresh leaf analysis; do not reuse cached results.
         leaf_result_path = _leaf_result_path(snapshot_dir, repo, target_tag, i)
-        if leaf_result_path.exists():
-            print(f"  LEAF_RESULT[{i+1}]: {leaf_result_path} (cached)", file=sys.stderr)
-            leaf_results.append(parse_llm_results(leaf_result_path))
-        else:
-            print(f"  LEAF_RESULT[{i+1}]: MISSING — please analyze {leaf_data_path}", file=sys.stderr)
-            leaf_results.append(LLMFullReport())
-            missing.append(str(leaf_data_path))
+        print(f"  LEAF_RESULT[{i+1}]: MISSING — please analyze {leaf_data_path}", file=sys.stderr)
+        leaf_results.append(LLMFullReport())
+        missing.append(str(leaf_data_path))
 
     # If any leaf results are missing, we can't proceed
     if missing:
@@ -1964,15 +1932,8 @@ def _recursive_merge_with_prompts(
                 merged.append(a)
                 continue
 
-            # Check for cached merge result
+            # Always generate fresh merge prompt; do not reuse cached results.
             merge_result_path = _merge_result_path(snapshot_dir, repo, target_tag, depth, i // 2)
-            if merge_result_path.exists():
-                print(
-                    f"  MERGE_RESULT[d{depth}-{i//2}]: {merge_result_path} (cached)",
-                    file=sys.stderr,
-                )
-                merged.append(parse_merge_results(merge_result_path.read_text(encoding="utf-8")))
-                continue
 
             # Generate merge prompt
             compressed_a = compress_for_merge(a)
@@ -2077,7 +2038,7 @@ def _fallback_merge(a: LLMFullReport, b: LLMFullReport) -> LLMFullReport:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Analyze OpenClaw GitHub releases")
-    parser.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repo in owner/name format")
+    parser.add_argument("--repo", default=DEFAULT_REPO, help="OpenClaw GitHub repo in owner/name format (default: openclaw/openclaw)")
     parser.add_argument("--latest", action="store_true", help="Analyze latest stable release")
     parser.add_argument("--target", help="Target release tag/version")
     parser.add_argument("--compare", help="Compare baseline release tag/version")
@@ -2102,7 +2063,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--snapshot-dir",
         default=None,
-        help="Directory for the freshly fetched release-notes snapshot used by this run. Defaults to the platform cache directory (e.g. ~/.cache/openclaw-release-analyzer/snapshots).",
+        help="Directory for the freshly fetched release-notes snapshot used by this run. Defaults to the platform cache directory (e.g. ~/.cache/openclaw-release-notes-analyzer/snapshots).",
     )
     parser.add_argument("--output", help="Write Markdown report to file")
     parser.add_argument(
@@ -2219,59 +2180,7 @@ def _recursive_final_path(snapshot_dir: Path, repo: str, target_tag: str) -> Pat
 
 
 def _load_snapshot_or_fetch(args: argparse.Namespace) -> Tuple[Release, Optional[Release], List[Release], List[Release], Path]:
-    """Load existing snapshot if available and consistent, otherwise fetch from GitHub API."""
-    snapshot_dir = Path(args.snapshot_dir) if args.snapshot_dir else Path(default_cache_dir())
-    # Try to find an existing snapshot for this target
-    target_hint = args.target or "latest-stable"
-    snapshot_path = snapshot_path_func(snapshot_dir, args.repo, target_hint)
-
-    if snapshot_path.exists():
-        # Run consistency checks before trusting cached data
-        llm_results = None
-        try:
-            target_for_path = args.target or target_hint
-            llm_results = llm_results_path(snapshot_dir, args.repo, target_for_path)
-        except Exception:
-            pass
-
-        # Fetch fresh releases for freshness check (lightweight, single API call)
-        fresh_releases: Optional[List[Release]] = None
-        try:
-            fresh_releases = fetch_releases(args.repo, args.github_token)
-        except Exception:
-            pass
-
-        consistency = run_full_consistency_check(
-            snapshot_path, args, fresh_releases=fresh_releases, llm_results_path=llm_results
-        )
-
-        if not consistency.is_valid:
-            print(f"Warning: Snapshot consistency check failed for {snapshot_path.name}", file=sys.stderr)
-            for err in consistency.errors:
-                print(f"  [ERROR] {err}", file=sys.stderr)
-            for warn in consistency.warnings:
-                print(f"  [WARN]  {warn}", file=sys.stderr)
-            print("  → Cleaning up stale intermediates and re-fetching from GitHub API...", file=sys.stderr)
-            # Infer target tag from snapshot to clean up intermediates
-            try:
-                fm = _extract_frontmatter(snapshot_path)
-                stale_target = fm.get("target_version", "")
-                if stale_target:
-                    _cleanup_transient_files(snapshot_dir, args.repo, stale_target)
-            except Exception:
-                pass
-            return refresh_snapshot_and_load(args)
-
-        for warn in consistency.warnings:
-            print(f"Warning: [Snapshot] {warn}", file=sys.stderr)
-
-        try:
-            snapshot_releases = read_release_snapshot(snapshot_path)
-            target, compare, scoped = select_scope(args, snapshot_releases)
-            print(f"Info: Using consistent cached snapshot: {snapshot_path.name}", file=sys.stderr)
-            return target, compare, scoped, snapshot_releases, snapshot_path
-        except Exception:
-            pass  # fallback to fresh fetch
+    """Always fetch fresh release data from GitHub API (no snapshot caching)."""
     return refresh_snapshot_and_load(args)
 
 
@@ -2342,7 +2251,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             target, compare, scoped, releases, snapshot = refresh_snapshot_and_load(args)
             _lang = _resolve_lang(args)
 
-            _cleanup_transient_files(snapshot_dir, args.repo, target.tag_name)
+            _cleanup_target_files(snapshot_dir, args.repo, target.tag_name)
 
             import concurrent.futures
 
@@ -2487,7 +2396,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
                 # Fall through to standard Mode C / Mode B flow
             else:
-                _cleanup_transient_files(snapshot_dir, args.repo, target.tag_name)
+                _cleanup_target_files(snapshot_dir, args.repo, target.tag_name)
 
                 import concurrent.futures
 
@@ -2683,43 +2592,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not target_for_path:
                 target_for_path = "latest-stable"
 
-            # Check if cached llm-results.json exists from a previous run
-            results_path = llm_results_path(snapshot_dir, args.repo, target_for_path)
-            if results_path.exists():
-                # Verify LLM results consistency with the associated snapshot
-                snapshot_for_results = snapshot_path_func(snapshot_dir, args.repo, target_for_path)
-                llm_consistency = verify_llm_results_consistency(results_path, snapshot_for_results)
-                if not llm_consistency.is_valid:
-                    print(
-                        f"Warning: Cached LLM results failed consistency check; discarding.",
-                        file=sys.stderr,
-                    )
-                    for err in llm_consistency.errors:
-                        print(f"  [ERROR] {err}", file=sys.stderr)
-                    try:
-                        results_path.unlink()
-                    except OSError:
-                        pass
-                    # Fall through to prepare fresh analysis data
-                    print(
-                        "Info: Valid token detected; entering LLM-enhanced analysis mode.",
-                        file=sys.stderr,
-                    )
-                    return _run_prepare_analysis_data_mode()
-                for warn in llm_consistency.warnings:
-                    print(f"Warning: [LLM Results] {warn}", file=sys.stderr)
-                print(
-                    f"Info: Found cached LLM results at {results_path}; applying directly.",
-                    file=sys.stderr,
-                )
-                args.apply_llm_results = str(results_path)
-                # Continue to Mode B below
-            else:
-                print(
-                    "Info: Valid token detected; entering LLM-enhanced analysis mode.",
-                    file=sys.stderr,
-                )
-                return _run_prepare_analysis_data_mode()
+            # Always prepare fresh analysis data; do not reuse cached LLM results.
+            print(
+                "Info: Valid token detected; entering LLM-enhanced analysis mode.",
+                file=sys.stderr,
+            )
+            return _run_prepare_analysis_data_mode()
 
         # -------------------------------------------------------------------
         # Mode B: Apply LLM results and generate final report
@@ -2729,34 +2607,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not llm_results_file.exists():
                 raise RuntimeError(f"LLM results file not found: {llm_results_file}")
 
-            # P1: Avoid re-fetching from GitHub API — use cached snapshot if available
             target, compare, scoped, releases, snapshot = _load_snapshot_or_fetch(args)
             lang = _resolve_lang(args)
 
-            # Load cached base analysis or recompute
-            # Validate that cached base analysis matches current snapshot before reuse
-            base_path = base_analysis_path(snapshot_dir, args.repo, target.tag_name)
-            analyses: List[ChangeAnalysis] = []
-            if base_path.exists():
-                cached_analyses = read_base_analysis(base_path)
-                cached_tags = {a.release_tag for a in cached_analyses}
-                current_tags = {r.tag_name for r in scoped}
-                if cached_tags == current_tags:
-                    analyses = cached_analyses
-                else:
-                    print(
-                        f"Warning: Cached base analysis tags mismatch "
-                        f"(cached: {sorted(cached_tags)}, current: {sorted(current_tags)}); "
-                        f"recomputing...",
-                        file=sys.stderr,
-                    )
-                    try:
-                        base_path.unlink()
-                    except OSError:
-                        pass
-                    analyses = analyze_release_notes(scoped, lang)
-            else:
-                analyses = analyze_release_notes(scoped, lang)
+            _cleanup_target_files(snapshot_dir, args.repo, target.tag_name)
+
+            analyses = analyze_release_notes(scoped, lang)
             categories = _build_categories_from_analyses(analyses)
 
             # Parse LLM full report (LLM performs ALL semantic analysis)
@@ -2787,10 +2643,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_path.write_text(report, encoding="utf-8")
             print(str(output_path))
 
-            # P1-5: In --apply-llm-results mode, keep transient files for
-            # potential re-runs. They are cleaned up by _cleanup_expired_cache
-            # on subsequent runs or when the snapshot becomes stale.
-            _cleanup_legacy_prompts(snapshot_dir, args.repo, target.tag_name)
             return 0
 
         # LLM analysis is mandatory. This code path should not be reached

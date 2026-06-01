@@ -1,4 +1,4 @@
-# OpenClaw Release Analyzer — Analysis Rules
+# OpenClaw Release Notes Analyzer — Analysis Rules
 
 ## Stable Release Rules
 

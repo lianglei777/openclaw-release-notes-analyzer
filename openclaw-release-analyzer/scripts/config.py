@@ -268,15 +268,6 @@ NOISE_FILE_PATTERNS: List[str] = [
     r"\.md$",
 ]
 
-# OBSOLETE: Component path-based diff matching was removed because it
-# systematically produced irrelevant diffs (all groups received the same
-# generic config files).  The new commit-message bridge approach lets the
-# LLM perform semantic association instead of relying on brittle heuristics.
-# Retain empty dict for backward compatibility in any external callers.
-COMPONENT_DIFF_PATTERNS: Dict[str, List[str]] = {}
-
-MIN_GROUP_SIZE = 5
-MAX_GROUP_SIZE = 30
 
 
 # ---------------------------------------------------------------------------
@@ -419,12 +410,6 @@ def default_cache_dir() -> str:
 # ---------------------------------------------------------------------------
 # Recursive merge aggregation configuration
 # ---------------------------------------------------------------------------
-
-# When analyzing multiple versions, use recursive merge aggregation instead of
-# horizontal chunking. This enables cross-version progressive fix detection
-# and cumulative risk assessment by giving the LLM full context within each
-# version group and then merging results hierarchically.
-RECURSIVE_MERGE_ENABLED = True
 
 # Maximum tokens per leaf group. Each leaf contains complete notes + commits
 # for 1-3 consecutive versions. Should stay well below MAX_TOKENS_PER_CHUNK

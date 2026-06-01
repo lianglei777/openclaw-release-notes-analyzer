@@ -16,13 +16,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config import (
     COMMIT_RELEVANCE_PATTERNS,
-    LLM_RESULTS_TTL_DAYS,
     MAX_ANALYSIS_DATA_CHARS,
     MAX_COMMITS_FOR_ANALYSIS,
-    NO_DIFF_COMPONENTS,
-    NO_DIFF_KEYWORDS,
     NOISE_FILE_PATTERNS,
-    RELEASE_NOTES_MAX_VERSIONS,
 )
 from models import (
     ChangeAnalysis, CommitInfo, Release, Theme,
@@ -43,28 +39,6 @@ class LLMResultItem:
     code_evidence: str
     reasoning: str = ""
     suggested_category_correction: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Diff-need detection (preserved from original)
-# ---------------------------------------------------------------------------
-
-def _needs_diff(analysis: ChangeAnalysis) -> bool:
-    """Return True if this release note likely has meaningful code changes worth inspection."""
-    comp = (analysis.component or "").lower()
-    text = analysis.raw_text.lower()
-    for c in NO_DIFF_COMPONENTS:
-        if c.lower() in comp:
-            return False
-    for kw in NO_DIFF_KEYWORDS:
-        if kw in text:
-            return False
-    cats = set(analysis.categories)
-    if cats <= {"docs", "known_issue", "other"}:
-        return False
-    if cats & {"breaking", "security", "plugin", "api_sdk", "cli", "config", "dependency", "migration"}:
-        return True
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -521,20 +495,6 @@ def read_base_analysis(path: Path) -> List[ChangeAnalysis]:
     return analyses
 
 
-@dataclass
-class ParsedLLMResults:
-    """Container for all LLM analysis outputs.
-
-    Holds:
-    - note_results: per-note enhancements mapped by raw_text
-    - themes: semantic clusters of related release notes
-    - shadow_changes: undocumented modifications found in commits
-    """
-    note_results: Dict[str, LLMResultItem] = field(default_factory=dict)
-    themes: List[Theme] = field(default_factory=list)
-    shadow_changes: List[Dict[str, Any]] = field(default_factory=list)
-
-
 # ---------------------------------------------------------------------------
 # Result parsing and merging
 # ---------------------------------------------------------------------------
@@ -864,128 +824,6 @@ def confidence_for(
     if categories != ["other"]:
         return "medium"
     return "low"
-
-
-def enhance_analyses_with_llm(
-    analyses: List[ChangeAnalysis],
-    llm_results: Dict[str, LLMResultItem],
-) -> List[ChangeAnalysis]:
-    """Merge LLM analysis results into existing ChangeAnalysis objects.
-
-    Conflict arbitration based on LLM confidence:
-    - high:    fully trust LLM (full replacement)
-    - medium:  blended merge (LLM interpretation + rule reference; higher risk wins)
-    - low:     rule-based priority (rule interpretation + LLM low-confidence hint)
-
-    has_hidden_breaking is always respected regardless of confidence because
-    it is a signal that rule-based analysis cannot produce.
-    """
-    enhanced: List[ChangeAnalysis] = []
-    for analysis in analyses:
-        llm = llm_results.get(analysis.raw_text)
-        if llm and llm.enhanced_interpretation:
-            llm_risk = (
-                llm.risk_level
-                if llm.risk_level in ("high", "medium", "low")
-                else analysis.risk_level
-            )
-
-            # --- Conflict arbitration: interpretation ---
-            new_interpretation = _merge_interpretations(
-                analysis.interpretation, llm.enhanced_interpretation, llm.confidence
-            )
-
-            # --- Conflict arbitration: risk level ---
-            if llm.confidence == "high":
-                new_risk = llm_risk
-            elif llm.confidence == "medium":
-                new_risk = _higher_risk(analysis.risk_level, llm_risk)
-            else:
-                new_risk = analysis.risk_level
-
-            # has_hidden_breaking is a high-value signal — always upgrade to high
-            if llm.has_hidden_breaking and new_risk != "high":
-                new_risk = "high"
-
-            new_confidence = confidence_for(
-                analysis.categories, analysis.raw_text, llm_enhanced=True
-            )
-
-            # Build categories: preserve rule-based, append breaking if LLM discovered it
-            new_categories = list(analysis.categories)
-            if llm.has_hidden_breaking and "breaking" not in new_categories:
-                new_categories.append("breaking")
-
-            # Apply category correction if LLM suggests one
-            new_primary_category = analysis.primary_category
-            if llm.suggested_category_correction:
-                corr = llm.suggested_category_correction.lower().strip()
-                if corr and corr not in new_categories:
-                    new_categories.append(corr)
-                # Upgrade primary_category if the correction is higher priority
-                _priority_order = {
-                    "breaking": 0, "security": 1, "migration": 2, "dependency": 3,
-                    "plugin": 4, "api_sdk": 5, "cli": 6, "config": 7,
-                    "performance": 8, "fix": 9, "feature": 10,
-                    "docs": 11, "known_issue": 12, "other": 13,
-                }
-                old_pri = _priority_order.get(analysis.primary_category, 99)
-                new_pri = _priority_order.get(corr, 99)
-                if new_pri < old_pri:
-                    new_primary_category = corr
-
-            enhanced.append(
-                ChangeAnalysis(
-                    release_tag=analysis.release_tag,
-                    raw_text=analysis.raw_text,
-                    primary_category=new_primary_category,
-                    categories=new_categories,
-                    component=analysis.component,
-                    interpretation=new_interpretation,
-                    risk_level=new_risk,
-                    audience=analysis.audience,
-                    action_items=analysis.action_items,
-                    confidence=new_confidence,
-                    priority=analysis.priority
-                    + (20 if llm.has_hidden_breaking else 0),
-                    affected_files=llm.affected_files,
-                    llm_enhanced=True,
-                    code_evidence=llm.code_evidence,
-                    llm_reasoning=llm.reasoning,
-                )
-            )
-        else:
-            # No LLM result for this item — keep rule-based analysis
-            enhanced.append(analysis)
-    # Re-sort by priority after potential adjustments
-    return sorted(enhanced, key=lambda a: a.priority, reverse=True)
-
-
-def should_use_llm_enhancement(
-    analyses: List[ChangeAnalysis],
-) -> Tuple[bool, str]:
-    """Determine whether LLM enhancement is worthwhile based on rule-based signals.
-
-    Returns (should_use, reason_message).
-    """
-    total = len(analyses)
-    high_risk = sum(1 for a in analyses if a.risk_level == "high")
-    has_breaking = any(
-        "breaking" in a.categories or "migration" in a.categories for a in analyses
-    )
-    has_security = any("security" in a.categories for a in analyses)
-    has_plugin_api = any(
-        "plugin" in a.categories or "api_sdk" in a.categories for a in analyses
-    )
-    has_dependency = any("dependency" in a.categories for a in analyses)
-
-    if has_breaking or has_security or high_risk > 0:
-        return True, "High-signals detected (breaking/security/high-risk)"
-    if has_plugin_api or has_dependency:
-        return True, "Plugin/API/dependency surface changes detected"
-    if total < 10 and high_risk == 0:
-        return False, "Small low-risk release — rule-based analysis is sufficient"
-    return True, "Standard release with moderate change volume"
 
 
 # ---------------------------------------------------------------------------

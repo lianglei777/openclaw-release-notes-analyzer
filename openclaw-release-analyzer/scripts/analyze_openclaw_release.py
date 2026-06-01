@@ -36,7 +36,6 @@ from config import (
     default_cache_dir,
     LLM_RESULTS_TTL_DAYS,
     RELEASE_NOTES_MAX_VERSIONS,
-    RECURSIVE_MERGE_ENABLED,
     RECURSIVE_MERGE_MAX_TOKENS_PER_LEAF,
     RECURSIVE_MERGE_MAX_VERSIONS_PER_LEAF,
     RECURSIVE_MERGE_MAX_DEPTH,
@@ -52,14 +51,12 @@ from prompts import (
     compress_for_merge,
     confidence_for,
     discover_chunk_results,
-    enhance_analyses_with_llm,
     llm_results_path,
     merge_chunk_results,
     parse_llm_results,
     parse_merge_results,
     read_base_analysis,
     select_relevant_commits,
-    should_use_llm_enhancement,
     split_analysis_data_into_chunks,
     should_use_chunking,
     chunk_result_path,
@@ -1283,17 +1280,6 @@ def actions_for(categories: Sequence[str], risk: str, component: str, lang: str)
 
 
 
-def confidence_for(categories: Sequence[str], item: str, llm_enhanced: bool = False) -> str:
-    if llm_enhanced:
-        return "high"
-    has_component_prefix = bool(re.match(r"^[A-Za-z0-9_./@+ -]{2,80}:\s+", item))
-    if has_component_prefix and categories != ["other"]:
-        return "high"
-    if categories != ["other"]:
-        return "medium"
-    return "low"
-
-
 def analyze_change_item(item: str, release: Release, lang: str) -> ChangeAnalysis:
     categories = item_categories(item)
     component = infer_component(item)
@@ -1315,11 +1301,6 @@ def analyze_change_item(item: str, release: Release, lang: str) -> ChangeAnalysi
 
 # Module-level: statistics from the last analyze_release_notes call
 _last_dedup_stats: dict[str, int] = {}
-
-
-def get_last_dedup_stats() -> dict[str, int]:
-    """Return deduplication stats from the last analyze_release_notes call."""
-    return _last_dedup_stats.copy()
 
 
 def analyze_release_notes(scoped: Sequence[Release], lang: str) -> List[ChangeAnalysis]:
@@ -1523,37 +1504,6 @@ def select_important_files(
         total_chars += entry_chars
     return selected
 
-
-def format_diff_summary(files: List[Dict[str, Any]], lang: str = "zh") -> str:
-    """Format selected file changes into a concise text summary for LLM prompt."""
-    lines: List[str] = []
-    header = "代码变更摘要（按重要性排序）"
-    lines.append(f"## {header}")
-    lines.append("")
-    total_add = sum(f.get("additions", 0) for f in files)
-    total_del = sum(f.get("deletions", 0) for f in files)
-    stats = f"共 {len(files)} 个文件，+{total_add}/-{total_del}"
-    lines.append(f"*{stats}*")
-    lines.append("")
-    for f in files:
-        fname = f["filename"]
-        status = f["status"]
-        prev = f.get("previous_filename", "")
-        status_zh = {"added": "新增", "removed": "删除", "modified": "修改", "renamed": "重命名"}.get(status, status)
-        status_en = status
-        score = f.get("importance_score", 0)
-        lines.append(f"### {fname} ({status_zh}, +{f['additions']}/-{f['deletions']}, 重要性:{score})")
-        if prev:
-            lines.append(f"*原文件名: {prev}*")
-        patch = f.get("patch", "")
-        if patch:
-            lines.append("```diff")
-            lines.append(patch)
-            lines.append("```")
-        else:
-            lines.append("*(二进制文件或 patch 不可用)*")
-        lines.append("")
-    return "\n".join(lines)
 
 def _skill_dir() -> Path:
     """Return the skill installation directory."""

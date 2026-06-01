@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config import CATEGORY_PRIMARY_ORDER
-from i18n import T, _zh, translate_release_note_zh
+from i18n import T, _zh
 from models import (
     ChangeAnalysis,
     LLMCompatibilityRisk,
@@ -77,42 +77,12 @@ def recommendation(categories: Dict[str, List[str]], target: Release, strings: T
 
 
 
-def build_analysis_lookup(analyses: Sequence[ChangeAnalysis]) -> Dict[str, ChangeAnalysis]:
-    return {item.raw_text: item for item in analyses}
-
-
 def build_appendix_ids(analyses: Sequence[ChangeAnalysis], limit: Optional[int] = None) -> Dict[str, str]:
     displayed = analyses if limit is None else analyses[:limit]
     appendix_ids: Dict[str, str] = {}
     for sequence, item in enumerate(displayed, start=1):
         appendix_ids[item.raw_text] = f"R-{sequence:03d}"
     return appendix_ids
-
-
-def brief_change_summary(item: ChangeAnalysis, lang: str) -> str:
-    focus_zh = "常规升级验证"
-    if "breaking" in item.categories or "migration" in item.categories:
-        focus_zh = "兼容性、迁移步骤和旧用法回归"
-    elif "security" in item.categories:
-        focus_zh = "认证、权限、凭据或安全边界"
-    elif "dependency" in item.categories:
-        focus_zh = "依赖版本、安装链路、构建镜像或 CI/CD 运行时"
-    elif "plugin" in item.categories:
-        focus_zh = "插件 manifest、hook、加载顺序或扩展契约"
-    elif "api_sdk" in item.categories:
-        focus_zh = "API/SDK 导出、类型定义或封装层兼容性"
-    elif "cli" in item.categories:
-        focus_zh = "CLI 参数、子命令、输出格式或脚本兼容性"
-    elif "config" in item.categories:
-        focus_zh = "配置 schema、默认值或环境变量约定"
-    elif "performance" in item.categories:
-        focus_zh = "关键路径性能、稳定性或启动行为"
-    elif "fix" in item.categories:
-        focus_zh = "受影响流程的旧问题复现和修复确认"
-    elif "feature" in item.categories:
-        focus_zh = "是否需要新增能力及对应集成成本"
-
-    return f"影响 {item.component}，重点关注{focus_zh}。"
 
 
 def release_note_text(item: ChangeAnalysis, lang: str) -> str:
@@ -146,29 +116,6 @@ def render_release_note_index(analyses: Sequence[ChangeAnalysis], appendix_ids: 
 
 
 
-
-
-def scenario_advice(kind: str, categories: Dict[str, List[str]], strings: T) -> str:
-    dispatch = {
-        "plugin": (strings["adv_plugin_has_signal"], strings["adv_plugin_no_signal"]),
-        "api_sdk": (strings["adv_api_has_signal"], strings["adv_api_no_signal"]),
-        "security": (strings["adv_security_has_signal"], strings["adv_security_no_signal"]),
-        "performance": (strings["adv_perf_has_signal"], strings["adv_perf_no_signal"]),
-        "ordinary": (None, None),
-    }
-    has_signal_map = {
-        "plugin": bool(categories["plugin"] or categories["breaking"]),
-        "api_sdk": bool(categories["api_sdk"] or categories["breaking"]),
-        "security": bool(categories["security"]),
-        "performance": bool(categories["performance"]),
-        "ordinary": bool(categories["feature"] or categories["fix"]),
-    }
-    has_signal = has_signal_map.get(kind, False)
-    if kind == "ordinary":
-        if has_signal:
-            return strings["adv_feature_fix"]
-        return strings["adv_insufficient"]
-    return dispatch.get(kind, ("", ""))[0 if has_signal else 1]
 
 
 def render_prereleases(prereleases: Sequence[Release], include_beta: bool, strings: T) -> str:
@@ -230,56 +177,7 @@ def report_scope_note(total: int, rendered: int, lang: str) -> str:
     if rendered == total:
         return f"- 完整解读覆盖率：{total}/{total} 条（完整逐条解读见附录，无省略）。"
     return f"- 完整解读覆盖率：{rendered}/{total} 条（当前仅展示部分条目）。"
-    if rendered == total:
-        return f"- Per-note interpretation coverage: {total}/{total} items (complete details in appendix, no omissions)."
-    return f"- Per-note interpretation coverage: {rendered}/{total} items shown."
 
-
-
-def render_analytical_summary(analyses: Sequence[ChangeAnalysis], categories: Dict[str, List[str]], lang: str) -> str:
-
-    if not analyses:
-        return "- 未发现可分析的 release note 条目。"
-    high = [a for a in analyses if a.risk_level == "high"]
-    medium = [a for a in analyses if a.risk_level == "medium"]
-    top_components: List[str] = []
-    for item in analyses:
-        if item.component not in top_components and item.component != "General":
-            top_components.append(item.component)
-        if len(top_components) >= 5:
-            break
-    lines = [
-        f"- 本次共识别 {len(analyses)} 条可分析 release note，其中高风险 {len(high)} 条、中风险 {len(medium)} 条、低风险 {len(analyses) - len(high) - len(medium)} 条。",
-        report_scope_note(len(analyses), len(analyses), lang),
-        "- 下方“原始 Release Notes（增强标注）”按官方 release notes 原始顺序展示，每条附带分类、风险与附录编号。",
-    ]
-
-    if top_components:
-        lines.append(f"- 变化最集中的模块包括：{', '.join(top_components)}。")
-
-    if categories["breaking"] or categories["dependency"]:
-        lines.append("- 升级前最需要优先确认的是 breaking change、运行时/依赖要求和迁移相关条目，而不是只看新增功能。")
-    if categories["plugin"] or categories["api_sdk"]:
-        lines.append("- 插件、API/SDK、CLI 或配置相关变化属于开发者可见表面，相关团队应单独做兼容性验证。")
-    if categories["security"]:
-        lines.append("- 安全相关条目需要区分真正漏洞修复与认证/权限行为调整，并确认当前部署是否受影响。")
-    if categories["performance"]:
-        lines.append("- 性能和稳定性条目建议用回归、压力或启动测试验证实际收益。")
-    return "\n".join(lines)
-    lines = [
-        f"- Identified {len(analyses)} analyzable release note items: {len(high)} high-risk and {len(medium)} medium-risk.",
-    ]
-    if top_components:
-        lines.append(f"- Most affected components: {', '.join(top_components)}.")
-    if categories["breaking"] or categories["dependency"]:
-        lines.append("- Prioritize breaking changes, runtime/dependency requirements, and migration items before focusing on new features.")
-    if categories["plugin"] or categories["api_sdk"]:
-        lines.append("- Plugin, API/SDK, CLI, and configuration changes are developer-visible surfaces and need compatibility validation.")
-    if categories["security"]:
-        lines.append("- Security-related items should be reviewed to distinguish direct vulnerability fixes from auth/permission behavior changes.")
-    if categories["performance"]:
-        lines.append("- Performance and stability items should be validated with regression, stress, or startup tests.")
-    return "\n".join(lines)
 
 
 def _infer_theme(categories: Dict[str, List[str]], lang: str) -> str:
@@ -316,11 +214,6 @@ def _infer_magnitude(total: int, high_risk: int, lang: str) -> str:
     if total > 40 or high_risk >= 3:
         return "大"
     return "中等"
-    if total < 10 and high_risk == 0:
-        return "Small"
-    if total > 40 or high_risk >= 3:
-        return "Large"
-    return "Medium"
 
 
 def render_executive_summary(
@@ -448,79 +341,6 @@ def developer_facing_conclusion(analyses: Sequence[ChangeAnalysis], lang: str, s
         return "这版主要是配置结构和部署行为的调整，对已有插件代码影响不大，但运行时的配置加载路径可能有变化，建议重点核对 config 相关条目。"
     return "这版变动对插件 / channel 开发者有一定参考价值，建议优先浏览下方的「Top 变更」和「风险点」，再判断是否需要立即跟进。"
 
-    if has_breaking:
-        comps = ", ".join(top_components[:2]) if top_components else "core modules"
-        return f"This release carries compatibility baggage: {comps} contain breaking changes. Don't upgrade blindly—check the risk points below against your plugin interfaces, config, and dependencies first."
-    if security_count >= 3:
-        return "This is a security-hardening release with multiple auth, credential, and permission adjustments. If you use OAuth, SecretRef, or third-party channels, review each item before upgrading so you don't miss implicit grant changes."
-    if plugin_count >= 2 or api_count >= 2:
-        comps = ", ".join(top_components[:2]) if top_components else "plugins and SDK"
-        return f"Developer-friendly release with substantive updates in {comps}. No obvious compatibility traps; skim the Top 10, then validate the interfaces and tooling you care about."
-    if config_count >= 2:
-        return "Mainly config and deployment behavior changes. Existing plugin code is likely unaffected, but runtime config loading paths may shift—double-check the config items below."
-    return "Worth a look for plugin/channel developers. Start with the Top changes and risk points, then decide whether to upgrade now or defer."
-
-
-def render_top_changes_for_plugin_devs(analyses: Sequence[ChangeAnalysis], strings: T, lang: str) -> str:
-    top = top_changes_for_plugin_devs(analyses)
-    if not top:
-        return f"- {strings['no_relevant_changes']}"
-    lines: List[str] = []
-    for item in top:
-        categories = " / ".join(category_text(cat, lang) for cat in item.categories[:3])
-        risk = risk_text(item.risk_level, strings)
-        lines.append(f"- {release_note_text(item, lang)} ({categories}; {risk})")
-    return "\n".join(lines)
-
-
-def render_developer_impact_analysis(analyses: Sequence[ChangeAnalysis], lang: str, strings: T) -> str:
-    relevant = filter_plugin_dev_relevant(analyses)
-    if not relevant:
-        return f"- {strings['no_relevant_changes']}"
-
-    def summarize_category(category: str, label_zh: str) -> Optional[str]:
-        matched = [item for item in relevant if category in item.categories][:3]
-        if not matched:
-            return None
-        comps: List[str] = []
-        for item in matched:
-            comp = item.component or ""
-            if comp and comp not in comps and comp != "General":
-                comps.append(comp)
-        comp_str = "、".join(comps[:2]) if comps else ("多个模块")
-        texts = [item.raw_text for item in matched]
-
-        if category == "plugin":
-            if any("install" in t or "uninstall" in t for t in texts):
-                return f"- **{label_zh}**：{comp_str} 涉及插件安装/卸载和依赖清理逻辑，如果你维护或分发插件，需要确认生命周期行为是否有变化。"
-            return f"- **{label_zh}**：{comp_str} 有插件面更新，建议确认 hook、manifest 或 SDK 子路径引用是否正常。"
-        if category == "api_sdk":
-            if any("auth" in t or "OAuth" in t for t in texts):
-                return f"- **{label_zh}**：{comp_str} 调整了认证和 OAuth 流程，API 调用方式可能不变，但凭据获取路径需要重新验证。"
-            return f"- **{label_zh}**：{comp_str} 的 SDK 或 API 契约可能有调整，关注类型定义和子路径别名变化。"
-        if category == "config":
-            return f"- **{label_zh}**：{comp_str} 的配置加载或默认值有变化，部署前建议用真实配置跑一次 validate。"
-        if category == "cli":
-            return f"- **{label_zh}**：{comp_str} 的 CLI 行为有调整，doctor / update 等命令的输出或修复策略可能不同。"
-        if category == "security":
-            return f"- **{label_zh}**：{comp_str} 收紧了安全策略，特别是凭据解析和权限边界，升级前核对现有账号和授权配置是否仍然成立。"
-        return f"- **{label_zh}**：{comp_str} 有相关变更，建议查看具体条目。"
-    buckets = [
-        ("security", "认证与凭据"),
-        ("plugin", "插件与扩展"),
-        ("api_sdk", "API / SDK"),
-        ("config", "配置与部署"),
-        ("cli", "CLI / 工具链"),
-    ]
-
-    lines: List[str] = []
-    for cat, label_zh in buckets:
-        summary = summarize_category(cat, label_zh)
-        if summary:
-            lines.append(summary)
-
-    return "\n".join(lines) if lines else f"- {strings['no_relevant_changes']}"
-
 
 def render_compatibility_risks(analyses: Sequence[ChangeAnalysis], strings: T, lang: str) -> str:
     relevant = filter_plugin_dev_relevant(analyses)
@@ -589,127 +409,6 @@ def render_suggested_test_points(analyses: Sequence[ChangeAnalysis], lang: str) 
     if not suggestions:
         suggestions.append("至少验证插件加载、channel 收发、配置校验、升级/回滚四条主链路。")
     return "\n".join(f"- {item}" for item in suggestions[:5])
-
-
-def render_ignorable_changes(analyses: Sequence[ChangeAnalysis], lang: str) -> str:
-    relevant = filter_plugin_dev_relevant(analyses)
-    relevant_texts = {item.raw_text for item in relevant}
-    others = [item for item in analyses if item.raw_text not in relevant_texts and item.risk_level == "low"][:5]
-    if not others:
-        return "- 本次低相关低风险条目不多，建议仍快速浏览增强标注原文。"
-    return "\n".join(f"- {item.component or '通用'}：当前对插件 / channel 开发决策帮助有限，可放到第二轮阅读。" for item in others)
-    return "\n".join(f"- {item.component or 'General'}: likely peripheral to plugin/channel upgrade decisions; defer to a second pass if needed." for item in others)
-
-
-def _component_analysis_text(
-    component: str,
-    items: Sequence[ChangeAnalysis],
-    all_categories: Sequence[str],
-    lang: str,
-) -> str:
-    cats = set(all_categories)
-    texts = [i.raw_text.lower() for i in items]
-    has_breaking = "breaking" in cats or "migration" in cats
-    has_security = "security" in cats
-    has_plugin = "plugin" in cats
-    has_api = "api_sdk" in cats
-    has_config = "config" in cats
-    has_cli = "cli" in cats
-    has_dep = "dependency" in cats
-    has_perf = "performance" in cats
-    count = len(items)
-    parts = []
-    if has_breaking:
-        parts.append(f"{component} 存在明确的兼容性变更信号")
-        if has_security:
-            parts.append("，且与安全策略收紧同时出现")
-        parts.append(f"。这 {count} 条变化需要一起看，因为它们可能构成一套配套的接口或行为调整")
-        if any("removed" in t or "remove" in t for t in texts):
-            parts.append("，特别是涉及移除或废弃的条目，需要确认现有代码是否仍在支持范围内")
-        parts.append("。")
-    elif has_security:
-        parts.append(f"{component} 的安全面有集中调整。这 {count} 条变化围绕认证、权限或凭据管理展开")
-        if has_config:
-            parts.append("，且伴随配置层面的调整")
-        parts.append("。建议优先判断当前部署是否落在受影响范围内，而不是只看功能变化。")
-    elif has_plugin and has_api:
-        parts.append(f"{component} 的插件系统和 API/SDK 同时出现变更，推断是对开发者扩展面的一次配套调整。这 {count} 条变化中，插件侧的变化决定了扩展契约，API/SDK 侧的变化决定了集成方式")
-        if has_config:
-            parts.append("，配置调整则影响运行时加载行为")
-        parts.append("。建议同时验证插件和调用端。")
-    elif has_plugin:
-        parts.append(f"{component} 的插件面有 {count} 条更新。这些变化集中在插件的生命周期、加载机制或扩展能力上")
-        if any("manifest" in t for t in texts):
-            parts.append("，其中涉及 manifest 的条目尤为关键，因为它决定了插件能否被正确识别和加载")
-        parts.append("。自定义插件较多的团队需要把兼容性验证放进升级 checklist。")
-    elif has_api:
-        parts.append(f"{component} 的 API/SDK 有 {count} 条更新。这些变化影响公共接口、类型定义或导出结构")
-        if any("deprecated" in t or "deprecate" in t for t in texts):
-            parts.append("，其中包含的弃用提示需要特别关注，因为弃用项通常会在后续版本中转为 breaking change")
-        parts.append("。如果你有二次封装或外部集成，建议核对关键调用路径。")
-    elif has_config:
-        parts.append(f"{component} 的配置层有 {count} 条调整。这类变化的风险不在文案本身，而在于旧配置在目标版本中是否仍被接受、以及默认值的变化是否会改变运行时行为")
-        if has_dep:
-            parts.append("；同时伴随依赖或运行时调整，需要确认部署环境是否满足新要求")
-        parts.append("。")
-    elif has_cli:
-        parts.append(f"{component} 的 CLI 面有 {count} 条调整。命令参数、子命令、输出格式或退出码的变化最容易连带影响自动化脚本和运维流程")
-        if any("doctor" in t or "update" in t for t in texts):
-            parts.append("，doctor / update 等诊断命令的修复策略变化尤其值得回归验证")
-        parts.append("。")
-    elif has_dep:
-        parts.append(f"{component} 的依赖或运行时有 {count} 条调整。这类变化更像是环境前提的改动，需要先确认 Node.js、包管理器、锁文件、构建镜像和 CI/CD 运行时是否满足新的要求，否则升级可能卡在安装、构建或启动阶段。")
-    elif has_perf:
-        parts.append(f"{component} 有 {count} 条性能或稳定性相关更新。这类变化通常属于正向收益，但对高负载、长连接或关键路径敏感的场景，仍建议用现网相近流量做一次回归确认，避免收益伴随行为变化。")
-    else:
-        parts.append(f"{component} 有 {count} 条变更，主要面向功能增强或问题修复。这些变化的风险较低，是否值得升级主要取决于你是否需要这部分能力。")
-    return "".join(parts)
-    parts = []
-    if has_breaking:
-        parts.append(f"{component} shows explicit compatibility change signals")
-        if has_security:
-            parts.append(", coinciding with security policy tightening")
-        parts.append(f". These {count} changes should be reviewed together as they may represent a coordinated set of interface or behavior adjustments")
-        if any("removed" in t or "remove" in t for t in texts):
-            parts.append("; items involving removal or deprecation require confirming whether existing code remains within the supported range")
-        parts.append(".")
-    elif has_security:
-        parts.append(f"{component} has concentrated security adjustments. These {count} changes revolve around authentication, permissions, or credential management")
-        if has_config:
-            parts.append(", accompanied by configuration-layer changes")
-        parts.append(". Prioritize assessing whether your current deployment falls within the affected scope rather than focusing only on functional changes.")
-    elif has_plugin and has_api:
-        parts.append(f"Both plugin system and API/SDK changes appear in {component}, suggesting a coordinated adjustment to the developer extension surface. Among these {count} changes, plugin-side items determine the extension contract while API/SDK-side items determine integration patterns")
-        if has_config:
-            parts.append(", and configuration adjustments affect runtime loading behavior")
-        parts.append(". Validate both plugin and caller sides together.")
-    elif has_plugin:
-        parts.append(f"{component} has {count} plugin-surface updates, concentrated on plugin lifecycle, loading mechanisms, or extension capabilities")
-        if any("manifest" in t for t in texts):
-            parts.append("; manifest-related items are particularly critical as they determine whether plugins can be correctly discovered and loaded")
-        parts.append(". Teams with many custom plugins should include compatibility validation in their upgrade checklist.")
-    elif has_api:
-        parts.append(f"{component} has {count} API/SDK updates affecting public interfaces, type definitions, or export structures")
-        if any("deprecated" in t or "deprecate" in t for t in texts):
-            parts.append("; deprecation notices deserve special attention as deprecated items typically become breaking changes in subsequent releases")
-        parts.append(". If you have wrappers or external integrations, review key call paths before upgrading.")
-    elif has_config:
-        parts.append(f"{component} has {count} configuration-layer adjustments. The risk here is not the text itself but whether old configs are still accepted in the target version and whether default value changes alter runtime behavior")
-        if has_dep:
-            parts.append("; combined with dependency/runtime changes, confirm that the deployment environment meets new requirements")
-        parts.append(".")
-    elif has_cli:
-        parts.append(f"{component} has {count} CLI changes. Command arguments, subcommands, output format, or exit code changes most easily cascade into automation scripts and operational workflows")
-        if any("doctor" in t or "update" in t for t in texts):
-            parts.append("; repair strategy changes in diagnostic commands like doctor/update particularly warrant regression validation")
-        parts.append(".")
-    elif has_dep:
-        parts.append(f"{component} has {count} dependency or runtime adjustments. These are more like environment prerequisite changes: confirm Node.js, package manager, lockfile, build images, and CI/CD runtime meet new requirements before upgrading, or the upgrade may fail at install, build, or startup time.")
-    elif has_perf:
-        parts.append(f"{component} has {count} performance or stability updates. These are generally positive, but for high-load, long-connection, or critical-path-sensitive scenarios, still recommend regression confirmation with production-like traffic to ensure gains don't come with behavior changes.")
-    else:
-        parts.append(f"{component} has {count} changes, mainly feature enhancements or bug fixes. These carry low risk; whether to upgrade depends on whether you need these capabilities.")
-    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------

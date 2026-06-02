@@ -1125,12 +1125,16 @@ def _chunk_instructions(chunk_index: int, total_chunks: int, lang: str) -> str:
     )
 
 
-def _chunk_data_path(output_dir: Path, repo: str, target_tag: str, idx: int) -> Path:
+def chunk_data_path(output_dir: Path, repo: str, target_tag: str, idx: int) -> Path:
     """Return path for a chunk data file."""
     repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
     target_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", target_tag).strip("-") or "target"
     filename = CHUNK_DATA_PATTERN.format(repo=repo_part, target=target_part, idx=idx)
     return output_dir / filename
+
+
+# Backward compatibility alias
+_chunk_data_path = chunk_data_path
 
 
 def chunk_result_path(output_dir: Path, repo: str, target_tag: str, idx: int) -> Path:

@@ -34,7 +34,7 @@ KEYWORDS = {
     "security": [
         "security", "vulnerability", "cve", "cwe", "cvss",
         "auth", "authentication", "authorization",
-        "permission", "sandbox", "escape", "xss", "csrf", "rce",
+        "token", "access token", "permission", "sandbox", "escape", "xss", "csrf", "rce",
         "remote code execution", "injection", "secret", "credential",
         "affected version", "affected versions", "oauth", "sso",
     ],

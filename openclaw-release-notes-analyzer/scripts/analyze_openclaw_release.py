@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -48,6 +49,7 @@ from prompts import (
     base_analysis_path,
     build_analysis_data,
     build_merge_prompt,
+    chunk_data_path,
     compress_for_merge,
     confidence_for,
     discover_chunk_results,
@@ -1518,6 +1520,16 @@ def _is_inside_skill_dir(path: Path) -> bool:
         return False
 
 
+def _fallback_llm_results_path() -> Path:
+    """Return the system temp directory fallback path for LLM results.
+
+    This is used when the primary snapshot-dir path is unreliable
+    (e.g. Windows deep paths with certain tooling). The file name is
+    generic so it does not pollute the user's project directory.
+    """
+    return Path(tempfile.gettempdir()) / "openclaw-release-notes-analyzer-llm-results.json"
+
+
 def _cleanup_target_files(snapshot_dir: Path, repo: str, target_tag: str) -> None:
     """Remove all intermediate files for a specific target before fresh analysis."""
     repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
@@ -1530,6 +1542,7 @@ def _cleanup_target_files(snapshot_dir: Path, repo: str, target_tag: str) -> Non
         f"{prefix}-base-analysis.json",
         f"{prefix}-analysis-data.json",
         f"{prefix}-analysis-chunk-*.json",
+        f"{prefix}-analysis-result-chunk-*.json",
         f"{prefix}-leaf-*-analysis-data.json",
         f"{prefix}-leaf-*-llm-results.json",
         f"{prefix}-merge-*-prompt.txt",
@@ -2058,7 +2071,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--github-token",
         help="GitHub token for authenticated API access. Falls back to GITHUB_TOKEN environment variable. "
-             "Required for LLM-enhanced diff analysis; without it, only rule-based analysis is performed.",
+             "Required for LLM-enhanced diff analysis; without a valid token, analysis stops without generating a report.",
     )
     parser.add_argument(
         "--snapshot-dir",
@@ -2087,7 +2100,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--apply-llm-results",
-        help="Path to LLM analysis results JSON file. Merge these into the report generation.",
+        nargs="?",
+        const=True,
+        default=None,
+        help=(
+            "Path to LLM analysis results JSON file. Merge these into the report generation. "
+            "If used without a value, auto-discovers the LLM results file from the snapshot directory or cwd."
+        ),
+    )
+    parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help=(
+            "Read LLM analysis results JSON from stdin instead of a file. "
+            "Useful when the AI agent passes results via pipe. "
+            "Example: cat llm-results.json | python script.py --target v1.0 --apply-llm-results --stdin"
+        ),
     )
     parser.add_argument(
         "--no-llm",
@@ -2190,6 +2218,86 @@ def snapshot_path_func(snapshot_dir: Path, repo: str, target: str) -> Path:
     repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
     target_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", target).strip("-") or "latest-stable"
     return snapshot_dir / f"{repo_part}-{target_part}-release-notes.md"
+
+
+def _auto_discover_llm_results(
+    snapshot_dir: Path, repo: str, target_tag: str
+) -> Path:
+    """Auto-discover LLM results file for a repo/target.
+
+    Searches in this order:
+    1. Canonical llm-results.json in snapshot_dir
+    2. Generic llm-results.json in snapshot_dir (for backward compat)
+    3. System temp directory fallback (avoids polluting user workspace)
+    4. Chunk result files (single or multiple)
+
+    Returns the discovered path. Raises RuntimeError if none found,
+    with a diagnostic message listing candidate files.
+    """
+    repo_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repo"
+    target_part = re.sub(r"[^A-Za-z0-9_.-]+", "-", target_tag).strip("-") or "target"
+    prefix = f"{repo_part}-{target_part}"
+
+    # 1. Check canonical llm-results.json in snapshot_dir
+    canonical = llm_results_path(snapshot_dir, repo, target_tag)
+    if canonical.exists():
+        return canonical
+
+    # 2. Check generic llm-results.json in snapshot_dir (backward compat)
+    generic = snapshot_dir / "llm-results.json"
+    if generic.exists():
+        return generic
+
+    # 3. Check system temp directory fallback (does not pollute user workspace)
+    fallback = _fallback_llm_results_path()
+    if fallback.exists():
+        print(
+            f"Info: Discovered LLM results in temp fallback: {fallback}",
+            file=sys.stderr,
+        )
+        return fallback
+
+    # 4. Check chunk result files in snapshot_dir
+    chunk_results = discover_chunk_results(snapshot_dir, repo, target_tag)
+    if len(chunk_results) == 1:
+        return chunk_results[0]
+    if len(chunk_results) > 1:
+        raise RuntimeError(
+            f"Multiple chunk result files found for {repo} {target_tag}. "
+            f"Use --merge-chunk-results to merge them first, or specify a single file with --apply-llm-results <path>.\n"
+            f"Found: {', '.join(str(p.name) for p in chunk_results)}"
+        )
+
+    # 5. Nothing found — provide diagnostic info
+    candidates: List[str] = []
+    search_dirs = [snapshot_dir, fallback.parent]
+    for search_dir in search_dirs:
+        for pattern in (
+            f"{prefix}-llm-results.json",
+            f"{prefix}-llm-results-chunk-*.json",
+            f"{prefix}-analysis-result-chunk-*.json",
+            "llm-results.json",
+        ):
+            for f in search_dir.glob(pattern):
+                candidates.append(f"{search_dir.name}/{f.name}")
+
+    searched = ", ".join(str(d) for d in search_dirs)
+    msg = (
+        f"LLM results file not found for {repo} {target_tag}.\n"
+        f"Searched in: {searched}\n"
+        f"Expected one of:\n"
+        f"  - {canonical}  (canonical path)\n"
+        f"  - {fallback}  (temp fallback)\n"
+    )
+    if candidates:
+        msg += f"Similar files found: {', '.join(candidates)}\n"
+    else:
+        msg += "No matching files found.\n"
+    msg += (
+        "Hint: Run --prepare-analysis-data first, then have an AI agent analyze the data "
+        "and write results to the expected path."
+    )
+    raise RuntimeError(msg)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -2303,12 +2411,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # Auto-evaluate whether chunking is needed
             needs_chunking, est_tokens = should_use_chunking(data)
 
+            # Compute the canonical LLM results path for both branches
+            results_path = llm_results_path(snapshot_dir, args.repo, target.tag_name)
+            fallback_path = _fallback_llm_results_path()
+
             if needs_chunking or args.prepare_chunks:
                 # Automatic chunking: split data into chunks for distributed processing
                 chunk_paths = split_analysis_data_into_chunks(
                     data, snapshot_dir, args.repo, target.tag_name
                 )
+                # Verify all output files were written correctly
+                for _vp in [data_path, base_path, *chunk_paths]:
+                    if not _vp.exists() or _vp.stat().st_size == 0:
+                        raise RuntimeError(f"Failed to write analysis file: {_vp}")
                 print(f"ANALYSIS_DATA_READY: 1")
+                print(f"DATA_VERIFIED: 1")
                 print(f"DATA: {data_path}")
                 print(f"BASE_ANALYSIS: {base_path}")
                 print(f"CHUNKING_REQUIRED: 1")
@@ -2317,6 +2434,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 for i, cp in enumerate(chunk_paths):
                     print(f"CHUNK_{i}: {cp}")
                 print(f"MERGE_COMMAND: --merge-chunk-results")
+                print(f"LLM_RESULTS_TARGET: {results_path}")
+                print(f"FALLBACK_LLM_RESULTS_TARGET: {fallback_path}")
                 # Auto-detect existing chunk results
                 existing_results = discover_chunk_results(snapshot_dir, args.repo, target.tag_name)
                 if existing_results:
@@ -2324,14 +2443,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     for i, rp in enumerate(existing_results):
                         print(f"CHUNK_RESULT_{i}: {rp}")
             else:
+                # Single-chunk: also write analysis-chunk-000.json so external AI
+                # always uses the same chunk workflow regardless of data size.
+                chunk_path = chunk_data_path(snapshot_dir, args.repo, target.tag_name, 0)
+                chunk_path.write_text(
+                    json.dumps(
+                        {
+                            **data,
+                            "meta": {
+                                **data.get("meta", {}),
+                                "chunk_index": 0,
+                                "total_chunks": 1,
+                                "notes_in_chunk": len(data.get("release_notes", [])),
+                                "commits_in_chunk": len(data.get("commits", [])),
+                                "is_partial": False,
+                            },
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                # Verify all output files were written correctly
+                for _vp in [data_path, base_path, chunk_path]:
+                    if not _vp.exists() or _vp.stat().st_size == 0:
+                        raise RuntimeError(f"Failed to write analysis file: {_vp}")
                 print(f"ANALYSIS_DATA_READY: 1")
+                print(f"DATA_VERIFIED: 1")
                 print(f"DATA: {data_path}")
                 print(f"BASE_ANALYSIS: {base_path}")
                 print(f"CHUNKING_REQUIRED: 0")
                 print(f"ESTIMATED_TOKENS: {est_tokens}")
+                print(f"CHUNK_0: {chunk_path}")
+                print(f"LLM_RESULTS_TARGET: {results_path}")
+                print(f"FALLBACK_LLM_RESULTS_TARGET: {fallback_path}")
 
             # Auto-detect existing llm-results.json from previous run
-            results_path = llm_results_path(snapshot_dir, args.repo, target.tag_name)
             if results_path.exists():
                 print(f"LLM_RESULTS_CACHED: {results_path}")
 
@@ -2602,21 +2749,68 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # -------------------------------------------------------------------
         # Mode B: Apply LLM results and generate final report
         # -------------------------------------------------------------------
-        if args.apply_llm_results:
-            llm_results_file = Path(args.apply_llm_results)
-            if not llm_results_file.exists():
-                raise RuntimeError(f"LLM results file not found: {llm_results_file}")
-
+        if args.apply_llm_results is not None:
+            # Resolve target first (needed for auto-discovery)
             target, compare, scoped, releases, snapshot = _load_snapshot_or_fetch(args)
             lang = _resolve_lang(args)
 
-            _cleanup_target_files(snapshot_dir, args.repo, target.tag_name)
+            # Resolve LLM results file
+            llm_results_file: Path
+            stdin_temp_file: Optional[Path] = None
+
+            if args.stdin:
+                # Read LLM results from stdin, save to a temp file in snapshot dir
+                print("Info: Reading LLM results from stdin...", file=sys.stderr)
+                try:
+                    stdin_data = sys.stdin.read()
+                    if not stdin_data.strip():
+                        raise RuntimeError("Stdin is empty. Expected JSON LLM analysis results.")
+                    # Validate it's valid JSON before saving
+                    _ = json.loads(stdin_data)
+                    _ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                    stdin_temp_file = snapshot_dir / f"llm-results-stdin-{_ts}.json"
+                    stdin_temp_file.write_text(stdin_data, encoding="utf-8")
+                    llm_results_file = stdin_temp_file
+                    print(f"Info: Saved stdin LLM results to: {llm_results_file}", file=sys.stderr)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(f"Invalid JSON from stdin: {exc}") from exc
+            elif args.apply_llm_results is True:
+                # Auto-discover mode: --apply-llm-results used without a path
+                llm_results_file = _auto_discover_llm_results(
+                    snapshot_dir, args.repo, target.tag_name
+                )
+                print(f"Info: Auto-discovered LLM results: {llm_results_file}", file=sys.stderr)
+            else:
+                # Explicit path provided
+                explicit_path = Path(args.apply_llm_results)
+                if explicit_path.exists():
+                    llm_results_file = explicit_path
+                else:
+                    # Tolerance: try auto-discovery if explicit path doesn't exist
+                    # (e.g., user provided a bare filename instead of full path)
+                    try:
+                        llm_results_file = _auto_discover_llm_results(
+                            snapshot_dir, args.repo, target.tag_name, cwd=Path.cwd()
+                        )
+                        print(
+                            f"Warning: Explicit path not found ({explicit_path}). "
+                            f"Using auto-discovered file: {llm_results_file}",
+                            file=sys.stderr,
+                        )
+                    except RuntimeError as auto_err:
+                        raise RuntimeError(
+                            f"LLM results file not found: {explicit_path}\n"
+                            f"Auto-discovery also failed: {auto_err}"
+                        ) from auto_err
 
             analyses = analyze_release_notes(scoped, lang)
             categories = _build_categories_from_analyses(analyses)
 
             # Parse LLM full report (LLM performs ALL semantic analysis)
             llm_report = parse_llm_results(llm_results_file)
+            # Clean up stdin temp file after parsing
+            if stdin_temp_file and stdin_temp_file.exists():
+                stdin_temp_file.unlink()
 
             # Generate report using LLM output directly
             if args.output:
@@ -2642,6 +2836,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(report, encoding="utf-8")
             print(str(output_path))
+
+            # Clean up intermediate files only after report is successfully generated.
+            # This ensures the LLM results file (input) is available throughout
+            # the entire parsing and rendering phase.
+            _cleanup_target_files(snapshot_dir, args.repo, target.tag_name)
+
+            # Also clean up temp-directory fallback so it does not accumulate.
+            _fb = _fallback_llm_results_path()
+            if _fb.exists():
+                try:
+                    _fb.unlink()
+                except OSError:
+                    pass
 
             return 0
 

@@ -699,6 +699,48 @@ def render_shadow_changes(
     return "\n".join(lines)
 
 
+def render_facts_inferences_uncertainties(
+    target: Release,
+    compare: Optional[Release],
+    scoped: Sequence[Release],
+    snapshot_file: Optional[str],
+    output_file: Optional[str],
+    has_llm: bool,
+    lang: str,
+) -> str:
+    """Render a transparency section separating facts, inferences, and uncertainty."""
+    compare_text = compare.tag_name if compare else "无对比基线"
+    release_count = len(scoped)
+    analysis_mode = "LLM 增强分析" if has_llm else "规则基线分析"
+    target_status = "Stable" if target.is_stable else "Prerelease/Beta"
+
+    lines = [
+        "## 事实、推断与不确定项",
+        "",
+        "### 事实",
+        "",
+        f"- 目标版本：`{target.tag_name}`（{target_status}）。",
+        f"- 对比版本：`{compare_text}`。",
+        f"- 分析范围包含 {release_count} 个 release。",
+        "- Release metadata 和 release notes 来自 GitHub Releases API，并已写入本地 snapshot。",
+        f"- Snapshot 文件：`{snapshot_file or 'unknown'}`。",
+        f"- 报告文件：`{output_file or 'unknown'}`。",
+        "",
+        "### 推断",
+        "",
+        f"- 当前报告使用 {analysis_mode} 对 release notes、commits 和目录级代码变更统计进行解释。",
+        "- 分类、主题聚类、升级建议、公开 surface 影响和测试建议均属于分析推断。",
+        "- note-to-commit 关联基于 commit message、变更文件路径和 release note 语义匹配。",
+        "",
+        "### 不确定项",
+        "",
+        "- Release notes 未明确说明的兼容性影响仍可能需要查看 PR、Issue、源码或真实项目配置。",
+        "- 低置信度分类、缺失迁移说明、模糊依赖信号和未扫描本地项目都会增加判断不确定性。",
+        "- 未经用户明确授权，本报告不会扫描本地项目文件，因此无法断言用户项目是否实际受影响。",
+    ]
+    return "\n".join(lines)
+
+
 def render_per_note_analysis(
     analyses: Sequence[ChangeAnalysis],
     strings: T,
@@ -1069,6 +1111,16 @@ def render_report(
 {render_per_note_analysis(analyses, strings, lang, None)}
 """
 
+    facts_section = render_facts_inferences_uncertainties(
+        target=target,
+        compare=compare,
+        scoped=scoped,
+        snapshot_file=snapshot_file,
+        output_file=output_file,
+        has_llm=has_llm,
+        lang=lang,
+    )
+
     return f"""# {f('report_title')}
 
 
@@ -1144,6 +1196,10 @@ def render_report(
 
 
 {render_prereleases(prereleases, include_beta, strings)}
+
+---
+
+{facts_section}
 
 ---
 

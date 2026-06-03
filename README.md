@@ -35,18 +35,32 @@
 
 ## 快速开始
 
-```bash
-# 设置 GitHub Token
-export GITHUB_TOKEN=ghp_xxxxxxxxxxxx
+### 在 AI 工具中使用（自然语言指令）
 
-# 分析最新稳定版
-cd openclaw-release-notes-analyzer/scripts
-python analyze_openclaw_release.py --latest
-```
+如果你的 AI 工具支持调用 SKill，可以直接用自然语言描述需求，AI 会自动调用本工具完成分析。
 
-分析完成后，报告自动写入当前工作目录，文件名格式为 `{repo}-{version}-analysis.md`。
+**示例 1：分析最新稳定版**
+> "帮我分析一下 OpenClaw 最新版本的 release notes，看看有哪些重要的变更和升级风险。 githubtoken：xxxx"
+
+**示例 2：分析指定版本**
+> "分析一下 OpenClaw v2026.5.18 的 release notes，生成一份升级影响报告。githubtoken：xxxx"
+
+**示例 3：版本对比分析**
+> "对比 OpenClaw v1.2.3 和 v1.3.0 的差异，评估从 v1.2.3 升级到 v1.3.0 的影响。 githubtoken：xxxx"
+
+**示例 4：版本范围分析**
+> "分析一下 OpenClaw 从 v1.1.0 到 v1.3.0 的所有变更，检测有没有渐进式修复和累积 breaking changes。githubtoken：xxxx"
+
+**示例 5：关注特定方面**
+> "看看 OpenClaw 最新版本对插件系统有什么影响，API 有没有 breaking changes，安全方面有没有修复。githubtoken：xxxx"
+
+**示例 6：包含 Prerelease 预览**
+> "分析一下 OpenClaw 最新稳定版，顺便看看有没有更新的 beta/prerelease 值得关注。githubtoken：xxxx"
+
+AI 工具会根据你的描述自动判断分析范围，准备数据，执行 LLM 增强分析，并生成完整的中文升级影响报告。
 
 ---
+
 
 ## 命令行参数
 
@@ -128,8 +142,6 @@ python analyze_openclaw_release.py --from v1.1.0 --to v1.3.0
 ```bash
 python analyze_openclaw_release.py --latest --include-beta
 ```
-
----
 
 ## 分析模式
 
